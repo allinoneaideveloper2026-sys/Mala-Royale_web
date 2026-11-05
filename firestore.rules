@@ -1,0 +1,58 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function isDeveloper() {
+      return signedIn() && request.auth.token.email in ['allinoneaideveloper2026@gmail.com'];
+    }
+
+    function isOwner() {
+      return signedIn() && (
+        request.auth.token.email in ['owner@malaroyale.com'] ||
+        exists(/databases/$(database)/documents/hostAccess/$(request.auth.token.email))
+      );
+    }
+
+    function isStaff() {
+      return isDeveloper() || isOwner();
+    }
+
+    match /products/{productId} {
+      allow read: if true;
+      allow write: if isStaff();
+    }
+
+    match /settings/{settingId} {
+      allow read: if true;
+      allow write: if isStaff();
+    }
+
+    match /orders/{orderId} {
+      allow create: if signedIn()
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.courierNoticeAccepted == true;
+      allow read: if isStaff() || (signedIn() && resource.data.userId == request.auth.uid);
+      allow update: if isStaff();
+      allow delete: if false;
+    }
+
+    match /paymentReferences/{referenceId} {
+      allow get: if signedIn() && (
+        resource == null || resource.data.userId == request.auth.uid || isStaff()
+      );
+      allow list: if false;
+      allow create: if signedIn() && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    match /hostAccess/{email} {
+      allow get: if isStaff() || (signedIn() && request.auth.token.email == email);
+      allow list: if isDeveloper();
+      allow create, update: if isDeveloper() && request.resource.data.email == email;
+      allow delete: if isDeveloper();
+    }
+  }
+}

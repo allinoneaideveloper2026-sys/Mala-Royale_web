@@ -1,0 +1,36 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    function signedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function isStaff() {
+      return signedIn() && (
+        request.auth.token.email in ['allinoneaideveloper2026@gmail.com', 'owner@malaroyale.com'] ||
+        firestore.exists(/databases/(default)/documents/hostAccess/$(request.auth.token.email))
+      );
+    }
+
+    match /products/{productId}/images/{fileName} {
+      allow read: if true;
+      allow write: if isStaff()
+        && request.resource.size <= 10 * 1024 * 1024
+        && request.resource.contentType.matches('image/.*');
+    }
+
+    match /products/{productId}/videos/{fileName} {
+      allow read: if true;
+      allow write: if isStaff()
+        && request.resource.size <= 50 * 1024 * 1024
+        && request.resource.contentType.matches('video/(mp4|webm|quicktime)');
+    }
+
+    match /settings/payment-qr/{fileName} {
+      allow read: if true;
+      allow write: if isStaff()
+        && request.resource.size <= 5 * 1024 * 1024
+        && request.resource.contentType.matches('image/.*');
+    }
+  }
+}

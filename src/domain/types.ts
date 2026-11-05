@@ -10,6 +10,12 @@ export type OrderStage =
 
 export type UserRole = 'DEVELOPER' | 'OWNER' | 'CUSTOMER';
 
+export interface ProductMedia {
+  url: string;
+  type: 'image' | 'video';
+  name?: string;
+}
+
 export interface Product {
   id: string;
   name: string;
@@ -18,6 +24,7 @@ export interface Product {
   offerPrice?: number;
   description: string;
   image: string;
+  media?: ProductMedia[];
 }
 
 export interface CustomerAddress {
