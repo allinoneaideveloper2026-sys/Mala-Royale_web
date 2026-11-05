@@ -12,6 +12,10 @@ Courier charges are stored on their order. The customer pays using the host's pa
 
 Hosts can save From/To parcel details on each order and download a PDF parcel sheet. The customer To fields are prefilled from checkout and can be corrected before saving.
 
+Customers can save delivery addresses under their signed-in account; the order keeps a snapshot of the exact address submitted. Customers can see their own order address and packed-parcel photos, while hosts can see all orders and confirm delivery.
+
+Pincode entry checks the 6-digit format and queries India Post for postal-area metadata. That result is not a courier guarantee. For carrier serviceability, configure `VITE_PINCODE_PROXY_URL` to a server endpoint that accepts `POST { "pincode": "..." }` and returns `{ "serviceable": true|false, "provider": "...", "message": "...", "district": "...", "state": "...", "taluk": "..." }`. Keep DTDC, Delhivery, India Post business API, or other carrier credentials on the server, never in the browser. The host still explicitly confirms the address before item payment can be confirmed.
+
 There is no Google Sheets integration in this repository. Orders are stored in Firestore when configured, or only in browser memory in local demo mode.
 
 Until Firebase is configured, the site stays in local demo mode. Catalog and order changes in that mode are not shared across browsers or devices.

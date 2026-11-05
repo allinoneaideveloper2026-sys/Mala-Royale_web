@@ -2,13 +2,16 @@ import React, { useEffect, useRef, useState } from 'react';
 import { GoogleAuthProvider, onAuthStateChanged, signInWithPopup, signOut, type User } from 'firebase/auth';
 import { CONFIG } from './config';
 import { TRANSLATIONS, Language } from './i18n';
-import { UserRole, Product, ProductMedia, Order, CourierBill, CustomerAddress, ParcelDetails, ParcelParty } from './domain/types';
+import { UserRole, Product, ProductMedia, Order, CourierBill, CustomerAddress, ParcelDetails, ParcelParty, PincodeCheck, SavedDeliveryAddress } from './domain/types';
 import { globalOrderBook } from './domain/OrderBook';
 import { auth, firebaseConfigured } from './firebase';
 import {
   attachCloudCourierBill,
   authorizeHost,
+  checkDeliveryPincode,
   createCloudOrder,
+  confirmCloudOrderDelivery,
+  deleteCloudDeliveryAddress,
   isAuthorizedHost,
   isConfiguredDeveloper,
   isConfiguredOwner,
@@ -16,16 +19,19 @@ import {
   markCloudOrderDelivered,
   publishProduct,
   revokeHost,
+  saveCloudDeliveryAddress,
   saveCloudParcelDetails,
   seedInitialProducts,
   subscribeAuthorizedHosts,
   subscribeCheckoutQr,
+  subscribeSavedAddresses,
   subscribeOrders,
   subscribeProducts,
   submitCloudOrderForDispatch,
   submitCloudCourierPayment,
   uploadCheckoutQr,
   uploadCourierTrackerImage,
+  uploadPackedParcelImages,
   uploadProductMedia,
   verifyCloudPayment,
 } from './domain/firestoreStore';
@@ -76,6 +82,7 @@ function getOrderStatus(order: Order): string {
   if (order.stage === 'COURIER_CHARGE_VERIFIED') return 'Courier payment confirmed';
   if (order.stage === 'COURIER_RECEIPT_UPLOADED') return 'Courier bill ready';
   if (order.stage === 'PACKING') return 'Packing';
+  if (order.itemPayment && !order.deliveryConfirmed) return 'Delivery address awaiting host confirmation';
   if (order.itemPayment?.verified) return 'Item payment confirmed';
   if (order.itemPayment) return 'Item payment awaiting host confirmation';
   return 'Order received';
@@ -199,14 +206,120 @@ function CourierPaymentForm({
   );
 }
 
+function DeliveryAddressFields({
+  address,
+  setAddress,
+  isCheckingPincode,
+  onCheckPincode,
+}: {
+  address: CustomerAddress;
+  setAddress: React.Dispatch<React.SetStateAction<CustomerAddress>>;
+  isCheckingPincode: boolean;
+  onCheckPincode: () => void;
+}) {
+  const fields: Array<{ key: keyof CustomerAddress; label: string; required?: boolean; numeric?: boolean }> = [
+    { key: 'fullName', label: 'Customer name', required: true },
+    { key: 'phone', label: 'Phone number', required: true, numeric: true },
+    { key: 'houseNameOrNumber', label: 'House name / number' },
+    { key: 'street1', label: 'Street 1', required: true },
+    { key: 'street2', label: 'Street 2', required: true },
+    { key: 'landmark1', label: 'Landmark 1', required: true },
+    { key: 'landmark2', label: 'Landmark 2' },
+    { key: 'taluk', label: 'Taluk', required: true },
+    { key: 'district', label: 'District', required: true },
+    { key: 'pincode', label: 'Pincode', required: true, numeric: true },
+  ];
+
+  return (
+    <>
+      <p style={{ margin: 0, color: '#666', fontSize: '0.85rem' }}>Address details are collected only to deliver this order.</p>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))', gap: '0.6rem' }}>
+        {fields.map(field => (
+          <label key={field.key} style={{ display: 'grid', gap: '0.2rem', fontSize: '0.85rem' }}>
+            {field.label}{field.required ? ' *' : ''}
+            <input
+              value={String(address[field.key] || '')}
+              onChange={event => setAddress(previous => ({
+                ...previous,
+                [field.key]: event.target.value,
+                ...(field.key === 'pincode' ? { pincodeCheck: undefined } : {}),
+              }))}
+              required={field.required}
+              inputMode={field.numeric ? 'numeric' : 'text'}
+              maxLength={field.key === 'pincode' ? 6 : undefined}
+              pattern={field.key === 'pincode' ? '[0-9]{6}' : undefined}
+            />
+          </label>
+        ))}
+      </div>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.6rem', alignItems: 'center' }}>
+        <button type="button" disabled={isCheckingPincode || address.pincode.length !== 6} onClick={onCheckPincode} style={{ padding: '0.55rem 0.8rem' }}>
+          {isCheckingPincode ? 'Checking pincode...' : 'Check pincode online'}
+        </button>
+        {address.pincodeCheck && (
+          <span role="status" style={{ color: address.pincodeCheck.status === 'NOT_FOUND' || address.pincodeCheck.status === 'NOT_SERVICEABLE' ? '#b00020' : '#555', fontSize: '0.85rem' }}>
+            {address.pincodeCheck.provider}: {address.pincodeCheck.message}
+          </span>
+        )}
+      </div>
+    </>
+  );
+}
+
+function PackedParcelPhotos({
+  order,
+  onUpload,
+}: {
+  order: Order;
+  onUpload: (orderId: string, files: File[]) => Promise<void>;
+}) {
+  const [files, setFiles] = useState<File[]>([]);
+  const [uploading, setUploading] = useState(false);
+  const [error, setError] = useState('');
+
+  const upload = async () => {
+    if (files.length === 0 || uploading) return;
+    if (files.length > 5 || files.some(file => !file.type.startsWith('image/') || file.size > 10 * 1024 * 1024)) {
+      setError('Select up to 5 images, each smaller than 10 MB.');
+      return;
+    }
+    setUploading(true);
+    setError('');
+    try {
+      await onUpload(order.orderId, files);
+      setFiles([]);
+    } catch (uploadError) {
+      setError(uploadError instanceof Error ? uploadError.message : 'Could not upload parcel photos.');
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  return (
+    <div style={{ marginTop: '0.8rem', padding: '0.8rem', border: '1px solid #ddd', borderRadius: '6px' }}>
+      <strong>Packed parcel photos</strong>
+      {order.packedParcelMedia?.length ? (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', margin: '0.6rem 0' }}>
+          {order.packedParcelMedia.map((media, index) => <a key={`${media.url}-${index}`} href={media.url} target="_blank" rel="noreferrer"><img src={media.url} alt={`Packed parcel ${index + 1} for order ${order.orderId}`} style={{ width: '92px', height: '92px', objectFit: 'cover' }} /></a>)}
+        </div>
+      ) : <p style={{ margin: '0.35rem 0', color: '#666', fontSize: '0.85rem' }}>No packing photos added yet.</p>}
+      <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.5rem' }}>
+        <input type="file" accept="image/*" capture="environment" multiple onChange={event => setFiles(Array.from(event.target.files || []))} />
+        <button type="button" disabled={uploading || files.length === 0} onClick={() => void upload()} style={{ padding: '0.5rem 0.8rem' }}>{uploading ? 'Uploading...' : 'Upload packing photos'}</button>
+      </div>
+      {error && <p role="alert" style={{ color: '#b00020', marginBottom: 0 }}>{error}</p>}
+    </div>
+  );
+}
+
 function customerParcelParty(address: CustomerAddress): ParcelParty {
   return {
     fullName: address.fullName,
     phone: address.phone,
-    addressLine1: address.street,
+    addressLine1: [address.houseNameOrNumber, address.street1, address.street2, address.street].filter(Boolean).join(', '),
     addressLine2: [address.landmark1, address.landmark2].filter(Boolean).join(', '),
-    city: '',
-    state: '',
+    city: address.taluk || '',
+    state: address.district || '',
     pincode: address.pincode,
     country: 'India',
   };
@@ -472,14 +585,26 @@ export default function App() {
   const [isCheckoutOpen, setIsCheckoutOpen] = useState(false);
   const [activeOrders, setActiveOrders] = useState<Order[]>([]);
   const [hostOrderTab, setHostOrderTab] = useState<HostOrderTab>('ACTIVE');
-  const [customerTab, setCustomerTab] = useState<'SHOP' | 'ORDERS'>('SHOP');
+  const [customerTab, setCustomerTab] = useState<'SHOP' | 'ORDERS' | 'ADDRESSES'>('SHOP');
+  const [savedAddresses, setSavedAddresses] = useState<SavedDeliveryAddress[]>([]);
+  const [selectedAddressId, setSelectedAddressId] = useState('');
+  const [useSavedAddress, setUseSavedAddress] = useState(false);
+  const [saveAddressForLater, setSaveAddressForLater] = useState(false);
+  const [editingAddressId, setEditingAddressId] = useState<string | null>(null);
+  const [isCheckingPincode, setIsCheckingPincode] = useState(false);
 
   // Customer Form Data
   const [address, setAddress] = useState<CustomerAddress>({
     fullName: '',
     phone: '',
+    houseNameOrNumber: '',
+    street1: '',
+    street2: '',
     street: '',
     landmark1: '',
+    landmark2: '',
+    taluk: '',
+    district: '',
     pincode: '',
     googleMapsPin: '',
     consentTimestamp: ''
@@ -570,6 +695,27 @@ export default function App() {
       setPaymentQrUrl(url);
     }, error => setSyncError(error.message));
   }, []);
+
+  useEffect(() => {
+    if (firebaseConfigured) {
+      if (!firebaseUser) {
+        setSavedAddresses([]);
+        return;
+      }
+      return subscribeSavedAddresses(firebaseUser.uid, addresses => {
+        setSavedAddresses(addresses);
+        setSyncError('');
+      }, error => setSyncError(error.message));
+    }
+
+    try {
+      const saved = localStorage.getItem(`mala-royale:delivery-addresses:${userEmail}`);
+      setSavedAddresses(saved ? JSON.parse(saved) as SavedDeliveryAddress[] : []);
+    } catch {
+      setSavedAddresses([]);
+    }
+    return undefined;
+  }, [firebaseUser, userEmail]);
 
   const handleGoogleSignIn = async () => {
     if (!auth) return;
@@ -738,6 +884,21 @@ export default function App() {
   // Customer Action: Submit Order via OrderBook Engine
   const handlePlaceOrder = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!address.fullName.trim() || !address.phone.trim() || !address.street1?.trim() || !address.street2?.trim() || !address.landmark1.trim() || !address.taluk?.trim() || !address.district?.trim() || !/^\d{6}$/.test(address.pincode)) {
+      alert('Complete the required delivery-address fields before placing your order.');
+      setCheckoutStep(1);
+      return;
+    }
+    if (!address.pincodeCheck) {
+      alert('Check the pincode online before placing your order.');
+      setCheckoutStep(1);
+      return;
+    }
+    if (['NOT_FOUND', 'NOT_SERVICEABLE'].includes(address.pincodeCheck.status)) {
+      alert('This pincode could not be confirmed as deliverable. Please check the address or contact the host.');
+      setCheckoutStep(1);
+      return;
+    }
     if (!courierPolicyAccepted) {
       alert(t.acceptCourierNotice);
       return;
@@ -748,12 +909,17 @@ export default function App() {
     }
     try {
       const orderItems = cart.map(i => ({ productId: i.id, name: i.name, price: i.offerPrice || i.price, quantity: 1 }));
+      const deliveryAddress: CustomerAddress = {
+        ...address,
+        street: [address.houseNameOrNumber, address.street1, address.street2].filter(Boolean).join(', '),
+        consentTimestamp: new Date().toISOString(),
+      };
       const order = firebaseConfigured
         ? await createCloudOrder(
           firebaseUser!.uid,
           orderItems,
           cartTotal,
-          { ...address, consentTimestamp: new Date().toISOString() },
+          deliveryAddress,
           courierPolicyAccepted,
           utr,
         )
@@ -761,13 +927,30 @@ export default function App() {
           userEmail,
           orderItems,
           cartTotal,
-          { ...address, consentTimestamp: new Date().toISOString() },
+          deliveryAddress,
           courierPolicyAccepted
         );
 
       if (!firebaseConfigured) {
         globalOrderBook.submitItemPayment(order.orderId, cartTotal, utr, 'uploaded_proof.png');
         setActiveOrders(globalOrderBook.getAllOrders());
+      }
+      if (saveAddressForLater) {
+        const savedAddress: SavedDeliveryAddress = {
+          ...deliveryAddress,
+          id: selectedAddressId || `address-${Date.now()}`,
+        };
+        try {
+          if (firebaseConfigured && firebaseUser) {
+            await saveCloudDeliveryAddress(firebaseUser.uid, savedAddress);
+          } else {
+            const nextAddresses = [savedAddress, ...savedAddresses.filter(saved => saved.id !== savedAddress.id)];
+            setSavedAddresses(nextAddresses);
+            localStorage.setItem(`mala-royale:delivery-addresses:${userEmail}`, JSON.stringify(nextAddresses));
+          }
+        } catch (error) {
+          setSyncError(error instanceof Error ? error.message : 'Order placed, but the address could not be saved for later.');
+        }
       }
       setCart([]);
       setIsCheckoutOpen(false);
@@ -779,6 +962,42 @@ export default function App() {
         ? 'Firestore rejected this action. Check the deployed Firestore rules and signed-in account role.'
         : err.message;
       alert(message);
+    }
+  };
+
+  const handleConfirmDelivery = async (order: Order) => {
+    if (!order.address.pincodeCheck) {
+      setSyncError('This order needs an online pincode check before delivery can be confirmed.');
+      return;
+    }
+    if (['NOT_FOUND', 'NOT_SERVICEABLE'].includes(order.address.pincodeCheck.status)) {
+      setSyncError('This pincode is not confirmed as deliverable. Contact the customer or courier.');
+      return;
+    }
+    try {
+      if (firebaseConfigured) {
+        await confirmCloudOrderDelivery(order.orderId, firebaseUser?.email || userEmail);
+      } else {
+        globalOrderBook.confirmDelivery(order.orderId, userEmail);
+        setActiveOrders([...globalOrderBook.getAllOrders()]);
+      }
+    } catch (error) {
+      setSyncError(error instanceof Error ? error.message : 'Could not confirm the delivery address.');
+    }
+  };
+
+  const handlePackedParcelUpload = async (orderId: string, files: File[]) => {
+    try {
+      if (firebaseConfigured) {
+        await uploadPackedParcelImages(orderId, files);
+      } else {
+        const media: ProductMedia[] = files.map(file => ({ url: URL.createObjectURL(file), type: 'image', name: file.name }));
+        globalOrderBook.addPackedParcelMedia(orderId, media);
+        setActiveOrders([...globalOrderBook.getAllOrders()]);
+      }
+    } catch (error) {
+      setSyncError(error instanceof Error ? error.message : 'Could not upload packed-parcel photos.');
+      throw error;
     }
   };
 
@@ -892,6 +1111,77 @@ export default function App() {
       setSyncError(error instanceof Error ? error.message : 'Could not save parcel details.');
       throw error;
     }
+  };
+
+  const handleCheckPincode = async () => {
+    setIsCheckingPincode(true);
+    try {
+      const result = await checkDeliveryPincode(address.pincode);
+      setAddress(previous => ({
+        ...previous,
+        district: result.district || previous.district,
+        taluk: result.taluk || previous.taluk,
+        pincodeCheck: result,
+      }));
+    } finally {
+      setIsCheckingPincode(false);
+    }
+  };
+
+  const handleSaveDeliveryAddress = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!address.fullName.trim() || !address.phone.trim() || !address.street1?.trim() || !address.street2?.trim() || !address.landmark1.trim() || !address.taluk?.trim() || !address.district?.trim() || !/^\d{6}$/.test(address.pincode)) {
+      alert('Complete all required delivery-address fields before saving.');
+      return;
+    }
+    const savedAddress: SavedDeliveryAddress = {
+      ...address,
+      id: editingAddressId || `address-${Date.now()}`,
+      consentTimestamp: new Date().toISOString(),
+    };
+    try {
+      if (firebaseConfigured) {
+        if (!firebaseUser) throw new Error('Sign in with Google to save delivery addresses.');
+        await saveCloudDeliveryAddress(firebaseUser.uid, savedAddress);
+      } else {
+        const nextAddresses = [savedAddress, ...savedAddresses.filter(saved => saved.id !== savedAddress.id)];
+        setSavedAddresses(nextAddresses);
+        localStorage.setItem(`mala-royale:delivery-addresses:${userEmail}`, JSON.stringify(nextAddresses));
+      }
+      setSelectedAddressId(savedAddress.id);
+      setUseSavedAddress(true);
+      setEditingAddressId(null);
+      setCustomerTab('ADDRESSES');
+    } catch (error) {
+      setSyncError(error instanceof Error ? error.message : 'Could not save delivery address.');
+    }
+  };
+
+  const handleDeleteDeliveryAddress = async (addressId: string) => {
+    try {
+      if (firebaseConfigured) {
+        if (!firebaseUser) throw new Error('Sign in with Google to manage delivery addresses.');
+        await deleteCloudDeliveryAddress(firebaseUser.uid, addressId);
+      } else {
+        const nextAddresses = savedAddresses.filter(saved => saved.id !== addressId);
+        setSavedAddresses(nextAddresses);
+        localStorage.setItem(`mala-royale:delivery-addresses:${userEmail}`, JSON.stringify(nextAddresses));
+      }
+      if (selectedAddressId === addressId) {
+        setSelectedAddressId('');
+        setUseSavedAddress(false);
+      }
+    } catch (error) {
+      setSyncError(error instanceof Error ? error.message : 'Could not delete delivery address.');
+    }
+  };
+
+  const selectDeliveryAddress = (addressId: string) => {
+    const savedAddress = savedAddresses.find(saved => saved.id === addressId);
+    if (!savedAddress) return;
+    setSelectedAddressId(savedAddress.id);
+    setUseSavedAddress(true);
+    setAddress({ ...savedAddress, consentTimestamp: '', street: savedAddress.street || '' });
   };
 
   const filteredProducts = categoryFilter === 'All'
@@ -1078,7 +1368,7 @@ export default function App() {
                 {hostOrderTab === 'ACTIVE' && firebaseConfigured ? 'Incoming orders will appear here as customers submit them.' : 'No orders in this section.'}
               </p>
             ) : hostVisibleOrders.map(ord => {
-              const canDispatch = Boolean(ord.itemPayment?.verified) && (!ord.courierBill || Boolean(ord.courierPayment?.verified));
+              const canDispatch = Boolean(ord.deliveryConfirmed && ord.itemPayment?.verified) && (!ord.courierBill || Boolean(ord.courierPayment?.verified));
               return (
                 <article key={ord.orderId} style={{ border: '1px solid #ddd', padding: '1rem', borderRadius: '8px', marginBottom: '1rem' }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', gap: '0.8rem', flexWrap: 'wrap', fontWeight: 'bold' }}>
@@ -1089,6 +1379,22 @@ export default function App() {
                     Received {new Date(ord.createdAt).toLocaleString()} · Updated {new Date(ord.updatedAt).toLocaleString()}
                   </p>
                   <p style={{ fontSize: '0.9rem', margin: '0.4rem 0' }}>Customer: {ord.address.fullName} ({ord.address.phone})</p>
+                  <div style={{ margin: '0.6rem 0', padding: '0.75rem', background: '#f7f2ef', borderRadius: '5px' }}>
+                    <strong>Delivery address</strong>
+                    <p style={{ margin: '0.35rem 0' }}>
+                      {[ord.address.houseNameOrNumber, ord.address.street1, ord.address.street2, ord.address.landmark1, ord.address.landmark2, ord.address.taluk, ord.address.district, ord.address.pincode].filter(Boolean).join(', ') || ord.address.street}
+                    </p>
+                    {ord.address.pincodeCheck && <p style={{ margin: '0.25rem 0', fontSize: '0.85rem' }}>{ord.address.pincodeCheck.provider}: {ord.address.pincodeCheck.message}</p>}
+                    {ord.deliveryConfirmed ? (
+                      <p role="status" style={{ color: '#1b5e20', margin: '0.35rem 0 0' }}>
+                        Deliverable confirmed by {ord.deliveryConfirmedBy} · {ord.deliveryConfirmedAt ? new Date(ord.deliveryConfirmedAt).toLocaleString() : ''}
+                      </p>
+                    ) : (
+                      <button type="button" disabled={!ord.address.pincodeCheck || ['NOT_FOUND', 'NOT_SERVICEABLE'].includes(ord.address.pincodeCheck.status)} onClick={() => void handleConfirmDelivery(ord)} style={{ marginTop: '0.35rem', padding: '0.5rem 0.75rem' }}>
+                        Confirm address is deliverable
+                      </button>
+                    )}
+                  </div>
                   <ul style={{ margin: '0.5rem 0', paddingLeft: '1.2rem' }}>
                     {ord.items.map((item, index) => <li key={`${item.productId}-${index}`}>{item.name} × {item.quantity} · ₹{item.price * item.quantity}</li>)}
                   </ul>
@@ -1097,9 +1403,10 @@ export default function App() {
                   {ord.itemPayment && (
                     <div style={{ fontSize: '0.9rem', marginTop: '0.5rem' }}>
                       Item payment: {ord.itemPayment.verified ? 'Confirmed' : 'Awaiting confirmation'} · UTR <code>{ord.itemPayment.utr}</code>
-                      {!ord.itemPayment.verified && <button type="button" onClick={() => void handleVerifyPayment(ord.orderId, 'ITEM')} style={{ marginLeft: '0.5rem' }}>{t.verifyPayment}</button>}
+                      {!ord.itemPayment.verified && <button type="button" disabled={!ord.deliveryConfirmed} onClick={() => void handleVerifyPayment(ord.orderId, 'ITEM')} style={{ marginLeft: '0.5rem' }}>{t.verifyPayment}</button>}
                     </div>
                   )}
+                  <PackedParcelPhotos order={ord} onUpload={handlePackedParcelUpload} />
                   {ord.courierBill && (
                     <div style={{ marginTop: '0.6rem', padding: '0.7rem', background: '#f5f8fa', borderRadius: '5px' }}>
                       <strong>Courier charge: ₹{ord.courierBill.amount}</strong>
@@ -1149,7 +1456,46 @@ export default function App() {
               >
                 Recent orders{activeOrders.length > 0 ? ` (${activeOrders.length})` : ''}
               </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={customerTab === 'ADDRESSES'}
+                onClick={() => setCustomerTab('ADDRESSES')}
+                style={{ padding: '0.7rem 1rem', border: 0, borderBottom: customerTab === 'ADDRESSES' ? '3px solid #6e1a3a' : '3px solid transparent', background: 'transparent', color: '#6e1a3a', fontWeight: 'bold', cursor: 'pointer' }}
+              >
+                Addresses{savedAddresses.length > 0 ? ` (${savedAddresses.length})` : ''}
+              </button>
             </nav>
+
+            {customerTab === 'ADDRESSES' && (
+              <section aria-label="Saved delivery addresses">
+                <h2 style={{ color: '#6e1a3a', marginTop: 0 }}>Delivery addresses</h2>
+                {firebaseConfigured && !firebaseUser && <p role="status">Sign in with Google to save addresses to your account.</p>}
+                <div style={{ display: 'grid', gap: '0.7rem', marginBottom: '1.2rem' }}>
+                  {savedAddresses.map(saved => (
+                    <article key={saved.id} style={{ backgroundColor: '#fff', border: '1px solid #ddd', borderRadius: '6px', padding: '0.9rem' }}>
+                      <strong>{saved.fullName} · {saved.phone}</strong>
+                      <p style={{ margin: '0.35rem 0', color: '#555' }}>
+                        {[saved.houseNameOrNumber, saved.street1, saved.street2, saved.landmark1, saved.landmark2, saved.taluk, saved.district, saved.pincode].filter(Boolean).join(', ')}
+                      </p>
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem' }}>
+                        <button type="button" onClick={() => { selectDeliveryAddress(saved.id); setCustomerTab('SHOP'); setIsCheckoutOpen(true); setCheckoutStep(1); }} style={{ padding: '0.45rem 0.7rem' }}>Use at checkout</button>
+                        <button type="button" onClick={() => { setAddress({ ...saved }); setEditingAddressId(saved.id); }} style={{ padding: '0.45rem 0.7rem' }}>Edit</button>
+                        <button type="button" onClick={() => void handleDeleteDeliveryAddress(saved.id)} style={{ padding: '0.45rem 0.7rem' }}>Delete</button>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+                <form onSubmit={handleSaveDeliveryAddress} style={{ backgroundColor: '#fff', border: '1px solid #ddd', borderRadius: '6px', padding: '1rem', display: 'grid', gap: '0.8rem' }}>
+                  <h3 style={{ margin: 0 }}>{editingAddressId ? 'Edit address' : 'Add a delivery address'}</h3>
+                  <DeliveryAddressFields address={address} setAddress={setAddress} isCheckingPincode={isCheckingPincode} onCheckPincode={() => void handleCheckPincode()} />
+                  <button type="submit" style={{ justifySelf: 'start', backgroundColor: '#6e1a3a', color: '#fff', border: 0, borderRadius: '4px', padding: '0.6rem 0.9rem', cursor: 'pointer' }}>
+                    {editingAddressId ? 'Save address changes' : 'Save address'}
+                  </button>
+                  {editingAddressId && <button type="button" onClick={() => { setEditingAddressId(null); setAddress({ fullName: '', phone: '', houseNameOrNumber: '', street1: '', street2: '', street: '', landmark1: '', landmark2: '', taluk: '', district: '', pincode: '', consentTimestamp: '' }); }} style={{ justifySelf: 'start' }}>Cancel editing</button>}
+                </form>
+              </section>
+            )}
 
             {customerTab === 'SHOP' && (
               <>
@@ -1247,14 +1593,44 @@ export default function App() {
                   {checkoutStep === 1 && (
                     <div>
                       <h3>{t.step1Address}</h3>
-                      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem' }}>
-                        <input type="text" placeholder="Full Name *" value={address.fullName} onChange={e => setAddress({ ...address, fullName: e.target.value })} style={{ padding: '0.6rem', border: '1px solid #ccc', borderRadius: '4px' }} />
-                        <input type="text" placeholder="Phone Number *" value={address.phone} onChange={e => setAddress({ ...address, phone: e.target.value })} style={{ padding: '0.6rem', border: '1px solid #ccc', borderRadius: '4px' }} />
-                        <input type="text" placeholder="Street / Door No *" value={address.street} onChange={e => setAddress({ ...address, street: e.target.value })} style={{ padding: '0.6rem', border: '1px solid #ccc', borderRadius: '4px' }} />
-                        <input type="text" placeholder="Landmark *" value={address.landmark1} onChange={e => setAddress({ ...address, landmark1: e.target.value })} style={{ padding: '0.6rem', border: '1px solid #ccc', borderRadius: '4px' }} />
-                        <input type="text" placeholder="Pincode *" value={address.pincode} onChange={e => setAddress({ ...address, pincode: e.target.value })} style={{ padding: '0.6rem', border: '1px solid #ccc', borderRadius: '4px' }} />
-                      </div>
-                      <button onClick={() => setCheckoutStep(2)} disabled={!address.fullName || !address.pincode} style={{ marginTop: '1.2rem', backgroundColor: '#6e1a3a', color: '#fff', border: 'none', padding: '0.7rem', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', width: '100%' }}>Next: Item Payment</button>
+                      {savedAddresses.length > 0 && (
+                        <div style={{ display: 'grid', gap: '0.5rem', marginBottom: '0.8rem' }}>
+                          <label style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+                            <input type="checkbox" checked={useSavedAddress} onChange={event => {
+                              setUseSavedAddress(event.target.checked);
+                              if (event.target.checked && !selectedAddressId) selectDeliveryAddress(savedAddresses[0].id);
+                            }} />
+                            Use a saved address
+                          </label>
+                          {useSavedAddress && (
+                            <>
+                              <select aria-label="Select saved delivery address" value={selectedAddressId} onChange={event => selectDeliveryAddress(event.target.value)}>
+                                {savedAddresses.map(saved => <option key={saved.id} value={saved.id}>{saved.fullName} · {saved.street1} · {saved.pincode}</option>)}
+                              </select>
+                              <p style={{ margin: 0, color: '#555', fontSize: '0.85rem' }}>
+                                {[address.houseNameOrNumber, address.street1, address.street2, address.landmark1, address.landmark2, address.taluk, address.district, address.pincode].filter(Boolean).join(', ')}
+                              </p>
+                              <button type="button" disabled={isCheckingPincode || address.pincode.length !== 6} onClick={() => void handleCheckPincode()}>
+                                {isCheckingPincode ? 'Checking pincode...' : 'Check selected pincode online'}
+                              </button>
+                              {address.pincodeCheck && <span role="status">{address.pincodeCheck.provider}: {address.pincodeCheck.message}</span>}
+                            </>
+                          )}
+                        </div>
+                      )}
+                      {!useSavedAddress && <DeliveryAddressFields address={address} setAddress={setAddress} isCheckingPincode={isCheckingPincode} onCheckPincode={() => void handleCheckPincode()} />}
+                      {!useSavedAddress && (
+                        <label style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', marginTop: '0.6rem' }}>
+                          <input type="checkbox" checked={saveAddressForLater} onChange={event => setSaveAddressForLater(event.target.checked)} />
+                          Save this address for next time
+                        </label>
+                      )}
+                      <p style={{ color: '#666', fontSize: '0.8rem' }}>Delivery address only. The host will confirm courier serviceability before accepting payment.</p>
+                      <button
+                        onClick={() => setCheckoutStep(2)}
+                        disabled={!address.pincodeCheck || ['NOT_FOUND', 'NOT_SERVICEABLE'].includes(address.pincodeCheck.status) || (useSavedAddress ? !selectedAddressId : !address.fullName || !address.phone || !address.street1 || !address.street2 || !address.landmark1 || !address.taluk || !address.district || !/^\d{6}$/.test(address.pincode))}
+                        style={{ marginTop: '1.2rem', backgroundColor: '#6e1a3a', color: '#fff', border: 'none', padding: '0.7rem', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', width: '100%' }}
+                      >Next: Item Payment</button>
                     </div>
                   )}
 
@@ -1314,6 +1690,24 @@ export default function App() {
                     </ul>
                     <p style={{ margin: '0.4rem 0', fontWeight: 'bold' }}>Order total: ₹{ord.itemTotal}</p>
                     <p style={{ margin: '0.4rem 0', color: '#666', fontSize: '0.85rem' }}>Last updated {new Date(ord.updatedAt).toLocaleString()}</p>
+                    <div style={{ margin: '0.7rem 0', padding: '0.75rem', backgroundColor: '#f7f2ef', borderRadius: '6px' }}>
+                      <strong>Delivery address submitted</strong>
+                      <p style={{ margin: '0.35rem 0' }}>{ord.address.fullName} · {ord.address.phone}</p>
+                      <p style={{ margin: '0.35rem 0' }}>
+                        {[ord.address.houseNameOrNumber, ord.address.street1, ord.address.street2, ord.address.landmark1, ord.address.landmark2, ord.address.taluk, ord.address.district, ord.address.pincode].filter(Boolean).join(', ') || ord.address.street}
+                      </p>
+                      <p role="status" style={{ margin: '0.35rem 0', color: ord.deliveryConfirmed ? '#1b5e20' : '#8a4b08' }}>
+                        {ord.deliveryConfirmed ? `Host confirmed deliverable${ord.deliveryConfirmedAt ? ` · ${new Date(ord.deliveryConfirmedAt).toLocaleString()}` : ''}` : 'Waiting for host to confirm delivery serviceability'}
+                      </p>
+                    </div>
+                    {ord.packedParcelMedia && ord.packedParcelMedia.length > 0 && (
+                      <div style={{ margin: '0.7rem 0' }}>
+                        <strong>Packed parcel photos</strong>
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', marginTop: '0.4rem' }}>
+                          {ord.packedParcelMedia.map((media, index) => <a key={`${media.url}-${index}`} href={media.url} target="_blank" rel="noreferrer"><img src={media.url} alt={`Packed parcel ${index + 1} for order ${ord.orderId}`} style={{ width: '100px', height: '100px', objectFit: 'cover' }} /></a>)}
+                        </div>
+                      </div>
+                    )}
                     {ord.courierBill && (
                       <div style={{ marginTop: '0.6rem', backgroundColor: '#e8f5e9', padding: '0.8rem', borderRadius: '6px', fontSize: '0.9rem' }}>
                         <p style={{ margin: 0 }}>Courier: <strong>{ord.courierBill.courierName}</strong></p>

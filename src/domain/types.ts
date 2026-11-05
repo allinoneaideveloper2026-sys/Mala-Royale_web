@@ -31,12 +31,32 @@ export interface Product {
 export interface CustomerAddress {
   fullName: string;
   phone: string;
-  street: string;
+  houseNameOrNumber?: string;
+  street1?: string;
+  street2?: string;
   landmark1: string;
   landmark2?: string;
+  taluk?: string;
+  district?: string;
+  street?: string;
   pincode: string;
   googleMapsPin?: string;
   consentTimestamp: string;
+  pincodeCheck?: PincodeCheck;
+}
+
+export interface PincodeCheck {
+  status: 'SERVICEABLE' | 'NOT_SERVICEABLE' | 'POSTAL_CODE_FOUND' | 'NOT_FOUND' | 'UNAVAILABLE';
+  provider: string;
+  message: string;
+  checkedAt: string;
+  district?: string;
+  state?: string;
+  taluk?: string;
+}
+
+export interface SavedDeliveryAddress extends CustomerAddress {
+  id: string;
 }
 
 export interface ParcelParty {
@@ -84,7 +104,11 @@ export interface Order {
   isWithheld: boolean;
   courierNoticeAccepted: boolean;
   address: CustomerAddress;
+  deliveryConfirmed?: boolean;
+  deliveryConfirmedAt?: string;
+  deliveryConfirmedBy?: string;
   parcelDetails?: ParcelDetails;
+  packedParcelMedia?: ProductMedia[];
   itemPayment?: PaymentRecord;
   courierBill?: CourierBill;
   courierPayment?: PaymentRecord;

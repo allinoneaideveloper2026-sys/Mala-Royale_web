@@ -1,4 +1,4 @@
-import { Order, OrderStage, PaymentRecord, CourierBill, CustomerAddress, ParcelDetails } from './types';
+import { Order, OrderStage, PaymentRecord, CourierBill, CustomerAddress, ParcelDetails, ProductMedia } from './types';
 
 export class OrderBook {
   private orders: Map<string, Order> = new Map();
@@ -58,6 +58,7 @@ export class OrderBook {
     if (!order) throw new Error('Order not found');
 
     if (kind === 'ITEM' && order.itemPayment) {
+      if (!order.deliveryConfirmed) throw new Error('Host must confirm the delivery address before confirming payment.');
       order.itemPayment.verified = true;
       order.stage = 'ITEM_PAYMENT_VERIFIED';
     } else if (kind === 'COURIER' && order.courierPayment) {
@@ -111,6 +112,7 @@ export class OrderBook {
     const order = this.orders.get(orderId);
     if (!order) throw new Error('Order not found');
     if (order.isWithheld) throw new Error('Parcel is withheld by host.');
+    if (!order.deliveryConfirmed) throw new Error('Host must confirm the delivery address before dispatch.');
     if (order.courierBill && !order.courierPayment?.verified) {
       throw new Error('Courier payment must be confirmed before dispatch.');
     }
@@ -142,6 +144,28 @@ export class OrderBook {
     if (!order) throw new Error('Order not found');
     order.parcelDetails = parcelDetails;
     order.updatedAt = parcelDetails.savedAt;
+    return order;
+  }
+
+  public confirmDelivery(orderId: string, email: string): Order {
+    const order = this.orders.get(orderId);
+    if (!order) throw new Error('Order not found');
+    if (!order.address.pincodeCheck) throw new Error('Run an online pincode check before confirming delivery.');
+    if (['NOT_FOUND', 'NOT_SERVICEABLE'].includes(order.address.pincodeCheck.status)) {
+      throw new Error('This pincode is not confirmed as deliverable.');
+    }
+    order.deliveryConfirmed = true;
+    order.deliveryConfirmedAt = new Date().toISOString();
+    order.deliveryConfirmedBy = email;
+    order.updatedAt = order.deliveryConfirmedAt;
+    return order;
+  }
+
+  public addPackedParcelMedia(orderId: string, media: ProductMedia[]): Order {
+    const order = this.orders.get(orderId);
+    if (!order) throw new Error('Order not found');
+    order.packedParcelMedia = [...(order.packedParcelMedia || []), ...media];
+    order.updatedAt = new Date().toISOString();
     return order;
   }
 

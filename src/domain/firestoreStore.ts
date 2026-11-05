@@ -1,5 +1,6 @@
 import {
   collection,
+  arrayUnion,
   deleteDoc,
   deleteField,
   doc,
@@ -17,7 +18,7 @@ import {
 import { getDownloadURL, ref, uploadBytes, type FirebaseStorage } from 'firebase/storage';
 import { CONFIG } from '../config';
 import { firestore, storage } from '../firebase';
-import { CourierBill, CustomerAddress, Order, ParcelDetails, PaymentRecord, Product, ProductMedia } from './types';
+import { CourierBill, CustomerAddress, Order, ParcelDetails, PaymentRecord, PincodeCheck, Product, ProductMedia, SavedDeliveryAddress } from './types';
 
 function requireFirestore(): Firestore {
   if (!firestore) throw new Error('Firebase is not configured. Add the VITE_FIREBASE_* settings first.');
@@ -202,6 +203,9 @@ export async function verifyCloudPayment(orderId: string, kind: 'ITEM' | 'COURIE
     const snapshot = await transaction.get(orderRef);
     if (!snapshot.exists()) throw new Error('Order not found.');
     const order = snapshot.data() as Order;
+    if (kind === 'ITEM' && !order.deliveryConfirmed) {
+      throw new Error('Host must confirm the delivery address before confirming payment.');
+    }
     const paymentField = kind === 'ITEM' ? 'itemPayment' : 'courierPayment';
     if (!order[paymentField]) return;
     transaction.update(orderRef, {
@@ -297,6 +301,122 @@ export async function saveCloudParcelDetails(orderId: string, parcelDetails: Par
     parcelDetails,
     updatedAt: parcelDetails.savedAt,
   });
+}
+
+export function subscribeSavedAddresses(
+  userId: string,
+  onChange: (addresses: SavedDeliveryAddress[]) => void,
+  onError: (error: Error) => void,
+) {
+  const db = requireFirestore();
+  return onSnapshot(collection(db, 'users', userId, 'addresses'), snapshot => {
+    onChange(snapshot.docs.map(address => ({ ...address.data(), id: address.id } as SavedDeliveryAddress)));
+  }, onError);
+}
+
+export async function saveCloudDeliveryAddress(userId: string, address: SavedDeliveryAddress): Promise<void> {
+  const db = requireFirestore();
+  const { id, ...deliveryAddress } = address;
+  await setDoc(doc(db, 'users', userId, 'addresses', id), deliveryAddress);
+}
+
+export async function deleteCloudDeliveryAddress(userId: string, addressId: string): Promise<void> {
+  const db = requireFirestore();
+  await deleteDoc(doc(db, 'users', userId, 'addresses', addressId));
+}
+
+export async function checkDeliveryPincode(pincode: string): Promise<PincodeCheck> {
+  const normalizedPincode = pincode.trim();
+  const checkedAt = new Date().toISOString();
+  if (!/^\d{6}$/.test(normalizedPincode)) {
+    return { status: 'NOT_FOUND', provider: 'Local validation', message: 'Enter a valid 6-digit Indian pincode.', checkedAt };
+  }
+
+  if (CONFIG.pincodeProxyUrl) {
+    try {
+      const response = await fetch(CONFIG.pincodeProxyUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pincode: normalizedPincode }),
+      });
+      if (!response.ok) throw new Error(`Courier lookup failed (${response.status}).`);
+      const result = await response.json() as { serviceable?: boolean; provider?: string; message?: string; district?: string; state?: string; taluk?: string };
+      if (typeof result.serviceable !== 'boolean') throw new Error('Courier lookup response must include a serviceable boolean.');
+      return {
+        status: result.serviceable ? 'SERVICEABLE' : 'NOT_SERVICEABLE',
+        provider: result.provider || 'Courier serviceability provider',
+        message: result.message || (result.serviceable ? 'Courier service reports this pincode as serviceable.' : 'Courier service reports this pincode as not serviceable.'),
+        checkedAt,
+        district: result.district,
+        state: result.state,
+        taluk: result.taluk,
+      };
+    } catch (error) {
+      return { status: 'UNAVAILABLE', provider: 'Courier serviceability proxy', message: error instanceof Error ? error.message : 'Courier pincode lookup failed.', checkedAt };
+    }
+  }
+
+  try {
+    const response = await fetch(`https://api.postalpincode.in/pincode/${normalizedPincode}`);
+    if (!response.ok) throw new Error('Postal lookup is temporarily unavailable.');
+    const result = await response.json() as Array<{ Status?: string; Message?: string; PostOffice?: Array<{ District?: string; State?: string; Block?: string }> | null }>;
+    const postalData = result[0];
+    const office = postalData?.PostOffice?.[0];
+    if (postalData?.Status !== 'Success' || !office) {
+      return { status: 'NOT_FOUND', provider: 'India Post postal lookup', message: 'No postal area was found for this pincode.', checkedAt };
+    }
+    return {
+      status: 'POSTAL_CODE_FOUND',
+      provider: 'India Post postal lookup',
+      message: 'Postal area found. The host must still confirm courier delivery availability.',
+      checkedAt,
+      district: office.District,
+      state: office.State,
+      taluk: office.Block,
+    };
+  } catch (error) {
+    return { status: 'UNAVAILABLE', provider: 'India Post postal lookup', message: error instanceof Error ? error.message : 'Postal lookup failed.', checkedAt };
+  }
+}
+
+export async function confirmCloudOrderDelivery(orderId: string, email: string): Promise<void> {
+  const db = requireFirestore();
+  const orderRef = doc(db, 'orders', orderId);
+  const snapshot = await getDoc(orderRef);
+  if (!snapshot.exists()) throw new Error('Order not found.');
+  const order = snapshot.data() as Order;
+  if (!order.address.pincodeCheck) throw new Error('Run an online pincode check before confirming delivery.');
+  if (['NOT_FOUND', 'NOT_SERVICEABLE'].includes(order.address.pincodeCheck.status)) {
+    throw new Error('This pincode is not confirmed as deliverable.');
+  }
+  await updateDoc(orderRef, {
+    deliveryConfirmed: true,
+    deliveryConfirmedAt: new Date().toISOString(),
+    deliveryConfirmedBy: email,
+    updatedAt: new Date().toISOString(),
+  });
+}
+
+export async function uploadPackedParcelImages(orderId: string, files: File[]): Promise<ProductMedia[]> {
+  const db = requireFirestore();
+  const bucket = requireStorage();
+  if (files.length === 0 || files.length > 5) throw new Error('Choose between 1 and 5 packed-parcel photos.');
+  if (files.some(file => !file.type.startsWith('image/') || file.size > 10 * 1024 * 1024)) {
+    throw new Error('Each packed-parcel photo must be an image smaller than 10 MB.');
+  }
+
+  const media = await Promise.all(files.map(async file => {
+    const extension = file.name.split('.').pop()?.toLowerCase().replace(/[^a-z0-9]/g, '') || 'jpg';
+    const fileRef = ref(bucket, `orders/${orderId}/packed-parcel/${createId()}.${extension}`);
+    await uploadBytes(fileRef, file, { contentType: file.type });
+    return { url: await getDownloadURL(fileRef), type: 'image' as const, name: file.name };
+  }));
+
+  await updateDoc(doc(db, 'orders', orderId), {
+    packedParcelMedia: arrayUnion(...media),
+    updatedAt: new Date().toISOString(),
+  });
+  return media;
 }
 
 export function isConfiguredDeveloper(email: string): boolean {

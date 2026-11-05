@@ -46,5 +46,12 @@ service firebase.storage {
         && request.resource.size <= 10 * 1024 * 1024
         && request.resource.contentType.matches('image/.*');
     }
+
+    match /orders/{orderId}/packed-parcel/{fileName} {
+      allow read: if canReadOrder(orderId);
+      allow write: if isStaff()
+        && request.resource.size <= 10 * 1024 * 1024
+        && request.resource.contentType.matches('image/.*');
+    }
   }
 }
