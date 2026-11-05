@@ -8,4 +8,10 @@
 
 The app uses Google sign-in in Firebase mode. Product reads are public; only signed-in staff can change the catalog, and customers can read only their own orders. Do not use service-account keys in the browser or in Vercel's `VITE_` variables.
 
+Courier charges are stored on their order. The customer pays using the host's payment QR and submits the 12-digit UTR; a host must manually confirm that payment before dispatch is enabled. The app records the payment reference but does not process or verify bank transfers automatically.
+
+Hosts can save From/To parcel details on each order and download a PDF parcel sheet. The customer To fields are prefilled from checkout and can be corrected before saving.
+
+There is no Google Sheets integration in this repository. Orders are stored in Firestore when configured, or only in browser memory in local demo mode.
+
 Until Firebase is configured, the site stays in local demo mode. Catalog and order changes in that mode are not shared across browsers or devices.

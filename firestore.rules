@@ -35,7 +35,19 @@ service cloud.firestore {
         && request.resource.data.userId == request.auth.uid
         && request.resource.data.courierNoticeAccepted == true;
       allow read: if isStaff() || (signedIn() && resource.data.userId == request.auth.uid);
-      allow update: if isStaff();
+      allow update: if isStaff() || (
+        signedIn()
+        && resource.data.userId == request.auth.uid
+        && resource.data.courierBill != null
+        && resource.data.courierPayment == null
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['courierPayment', 'updatedAt'])
+        && request.resource.data.courierPayment.keys().hasOnly(['paymentId', 'kind', 'amount', 'utr', 'screenshotUrl', 'verified', 'submittedAt'])
+        && request.resource.data.courierPayment.kind == 'COURIER'
+        && request.resource.data.courierPayment.amount == resource.data.courierBill.amount
+        && request.resource.data.courierPayment.utr.matches('^[0-9]{12}$')
+        && request.resource.data.courierPayment.verified == false
+        && request.resource.data.courierPayment.submittedAt is string
+      );
       allow delete: if false;
     }
 

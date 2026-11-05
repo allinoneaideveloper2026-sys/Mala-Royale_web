@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { GoogleAuthProvider, onAuthStateChanged, signInWithPopup, signOut, type User } from 'firebase/auth';
 import { CONFIG } from './config';
 import { TRANSLATIONS, Language } from './i18n';
-import { UserRole, Product, ProductMedia, Order, CustomerAddress } from './domain/types';
+import { UserRole, Product, ProductMedia, Order, CourierBill, CustomerAddress, ParcelDetails, ParcelParty } from './domain/types';
 import { globalOrderBook } from './domain/OrderBook';
 import { auth, firebaseConfigured } from './firebase';
 import {
@@ -12,15 +12,20 @@ import {
   isAuthorizedHost,
   isConfiguredDeveloper,
   isConfiguredOwner,
+  markCloudOrderNotAccepted,
+  markCloudOrderDelivered,
   publishProduct,
   revokeHost,
+  saveCloudParcelDetails,
   seedInitialProducts,
   subscribeAuthorizedHosts,
   subscribeCheckoutQr,
   subscribeOrders,
   subscribeProducts,
   submitCloudOrderForDispatch,
+  submitCloudCourierPayment,
   uploadCheckoutQr,
+  uploadCourierTrackerImage,
   uploadProductMedia,
   verifyCloudPayment,
 } from './domain/firestoreStore';
@@ -57,6 +62,307 @@ const INITIAL_CATALOG: Product[] = [
 const MAX_PRODUCT_IMAGES = 6;
 const MAX_PRODUCT_VIDEOS = 1;
 const MAX_VIDEO_SECONDS = 30;
+
+type HostOrderTab = 'ACTIVE' | 'DISPATCHED' | 'HISTORY';
+
+function getOrderStatus(order: Order): string {
+  if (order.stage === 'NOT_ACCEPTED') return 'Not accepted';
+  if (order.stage === 'CANCELLED') return 'Cancelled';
+  if (order.stage === 'DELIVERED') return 'Delivered';
+  if (order.stage === 'SUBMITTED_FOR_DISPATCH') return 'Dispatched';
+  if (order.courierPayment?.verified) return 'Courier payment confirmed';
+  if (order.courierPayment) return 'Courier payment awaiting host confirmation';
+  if (order.courierBill) return 'Courier charge awaiting customer payment';
+  if (order.stage === 'COURIER_CHARGE_VERIFIED') return 'Courier payment confirmed';
+  if (order.stage === 'COURIER_RECEIPT_UPLOADED') return 'Courier bill ready';
+  if (order.stage === 'PACKING') return 'Packing';
+  if (order.itemPayment?.verified) return 'Item payment confirmed';
+  if (order.itemPayment) return 'Item payment awaiting host confirmation';
+  return 'Order received';
+}
+
+function CourierBillForm({
+  order,
+  onSave,
+}: {
+  order: Order;
+  onSave: (orderId: string, bill: Omit<CourierBill, 'billId'>, screenshot: File | null) => Promise<void>;
+}) {
+  const [courierName, setCourierName] = useState(order.courierBill?.courierName || '');
+  const [trackingId, setTrackingId] = useState(order.courierBill?.trackingId || '');
+  const [amount, setAmount] = useState(order.courierBill ? String(order.courierBill.amount) : '');
+  const [screenshot, setScreenshot] = useState<File | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!courierName.trim() || !trackingId.trim() || Number(amount) <= 0) return;
+    if (!screenshot && !order.courierBill?.receiptPhotoUrl) {
+      alert('Add a screenshot of the courier tracker before saving the bill.');
+      return;
+    }
+    if (screenshot && (!screenshot.type.startsWith('image/') || screenshot.size > 10 * 1024 * 1024)) {
+      setError('Choose an image screenshot smaller than 10 MB.');
+      return;
+    }
+    setSaving(true);
+    setError('');
+    try {
+      await onSave(order.orderId, {
+        courierName: courierName.trim(),
+        trackingId: trackingId.trim(),
+        amount: Number(amount),
+        receiptPhotoUrl: order.courierBill?.receiptPhotoUrl || '',
+      }, screenshot);
+      setScreenshot(null);
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : 'Courier bill could not be saved.');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <form onSubmit={submit} style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: '0.5rem', marginTop: '0.8rem' }}>
+      <input aria-label="Courier name" placeholder="Courier name" value={courierName} onChange={event => setCourierName(event.target.value)} required />
+      <input aria-label="Tracking ID" placeholder="Tracking ID" value={trackingId} onChange={event => setTrackingId(event.target.value)} required />
+      <input aria-label="Courier amount in rupees" type="number" min="1" step="0.01" placeholder="Amount (₹)" value={amount} onChange={event => setAmount(event.target.value)} required />
+      <label style={{ display: 'grid', gap: '0.25rem', fontSize: '0.85rem' }}>
+        {order.courierBill?.receiptPhotoUrl ? 'Replace tracker screenshot (optional)' : 'Tracker screenshot *'}
+        <input type="file" accept="image/*" capture="environment" onChange={event => setScreenshot(event.target.files?.[0] || null)} />
+      </label>
+      <button type="submit" disabled={saving} style={{ backgroundColor: '#0288d1', color: '#fff', border: 0, borderRadius: '4px', padding: '0.55rem 0.8rem', cursor: 'pointer', fontWeight: 'bold' }}>
+        {saving ? 'Saving bill...' : order.courierBill ? 'Update courier bill' : 'Add courier bill'}
+      </button>
+      {error && <span role="alert" style={{ gridColumn: '1 / -1', color: '#b00020' }}>{error}</span>}
+    </form>
+  );
+}
+
+function CourierPaymentForm({
+  order,
+  paymentQrUrl,
+  canSubmit,
+  onSubmit,
+}: {
+  order: Order;
+  paymentQrUrl: string;
+  canSubmit: boolean;
+  onSubmit: (orderId: string, utr: string) => Promise<void>;
+}) {
+  const [utr, setUtr] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState('');
+
+  if (!order.courierBill) return null;
+
+  const submit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    setSubmitting(true);
+    setError('');
+    try {
+      await onSubmit(order.orderId, utr.trim());
+      setUtr('');
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : 'Courier payment could not be submitted.');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div style={{ marginTop: '0.7rem', padding: '0.8rem', backgroundColor: '#f7f2ef', borderRadius: '6px' }}>
+      <p style={{ margin: '0 0 0.35rem' }}>Courier charge: <strong>₹{order.courierBill.amount}</strong></p>
+      {order.courierBill.receiptPhotoUrl && <a href={order.courierBill.receiptPhotoUrl} target="_blank" rel="noreferrer">View courier tracker screenshot</a>}
+      {paymentQrUrl && <img src={paymentQrUrl} alt="Courier payment QR" style={{ width: '150px', height: '150px', objectFit: 'contain', display: 'block', margin: '0.6rem 0' }} />}
+      {order.courierPayment ? (
+        <p role="status" style={{ marginBottom: 0, color: order.courierPayment.verified ? '#1b5e20' : '#8a4b08' }}>
+          {order.courierPayment.verified ? 'Courier payment confirmed by host.' : 'Courier payment submitted; waiting for host confirmation.'}
+          {' '}UTR: {order.courierPayment.utr}
+        </p>
+      ) : !canSubmit ? (
+        <p role="status" style={{ marginBottom: 0 }}>Sign in to submit this courier payment.</p>
+      ) : (
+        <form onSubmit={submit} style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', marginTop: '0.6rem' }}>
+          <label style={{ flex: '1 1 190px' }}>
+            Courier payment UTR
+            <input value={utr} onChange={event => setUtr(event.target.value)} required inputMode="numeric" pattern="[0-9]{12}" maxLength={12} title="Enter the 12-digit UTR" style={{ display: 'block', boxSizing: 'border-box', width: '100%', padding: '0.55rem' }} />
+          </label>
+          <button type="submit" disabled={submitting} style={{ alignSelf: 'end', backgroundColor: '#6e1a3a', color: '#fff', border: 0, borderRadius: '4px', padding: '0.6rem 0.8rem', cursor: 'pointer', fontWeight: 'bold' }}>
+            {submitting ? 'Submitting...' : `Submit ₹${order.courierBill.amount} payment`}
+          </button>
+          {error && <span role="alert" style={{ flexBasis: '100%', color: '#b00020' }}>{error}</span>}
+        </form>
+      )}
+    </div>
+  );
+}
+
+function customerParcelParty(address: CustomerAddress): ParcelParty {
+  return {
+    fullName: address.fullName,
+    phone: address.phone,
+    addressLine1: address.street,
+    addressLine2: [address.landmark1, address.landmark2].filter(Boolean).join(', '),
+    city: '',
+    state: '',
+    pincode: address.pincode,
+    country: 'India',
+  };
+}
+
+function ParcelSheet({
+  order,
+  onSave,
+}: {
+  order: Order;
+  onSave: (orderId: string, from: ParcelParty, to: ParcelParty) => Promise<void>;
+}) {
+  const [from, setFrom] = useState<ParcelParty>(order.parcelDetails?.from || {
+    fullName: '', phone: '', addressLine1: '', addressLine2: '', city: '', state: '', pincode: '', country: 'India',
+  });
+  const [to, setTo] = useState<ParcelParty>(order.parcelDetails?.to || customerParcelParty(order.address));
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const [savedSnapshot, setSavedSnapshot] = useState(order.parcelDetails ? JSON.stringify({ from: order.parcelDetails.from, to: order.parcelDetails.to }) : '');
+  const currentSnapshot = JSON.stringify({ from, to });
+  const saved = Boolean(savedSnapshot) && currentSnapshot === savedSnapshot;
+
+  useEffect(() => {
+    if (!order.parcelDetails) return;
+    setFrom(order.parcelDetails.from);
+    setTo(order.parcelDetails.to);
+    setSavedSnapshot(JSON.stringify({ from: order.parcelDetails.from, to: order.parcelDetails.to }));
+  }, [order.orderId, order.parcelDetails?.savedAt]);
+
+  const updateParty = (side: 'from' | 'to', field: keyof ParcelParty, value: string) => {
+    const setter = side === 'from' ? setFrom : setTo;
+    setter(party => ({ ...party, [field]: value }));
+  };
+
+  const save = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!from.fullName.trim() || !from.phone.trim() || !from.addressLine1.trim() || !from.pincode.trim()) {
+      setError('Complete the From name, phone, address, and pincode.');
+      return;
+    }
+    if (!to.fullName.trim() || !to.phone.trim() || !to.addressLine1.trim() || !to.pincode.trim()) {
+      setError('Complete the To name, phone, address, and pincode.');
+      return;
+    }
+    setSaving(true);
+    setError('');
+    try {
+      await onSave(order.orderId, from, to);
+      setSavedSnapshot(currentSnapshot);
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : 'Parcel details could not be saved.');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const downloadPdf = async () => {
+    if (!saved) return;
+    const { jsPDF } = await import('jspdf');
+    const pdf = new jsPDF({ unit: 'mm', format: 'a4' });
+    const left = 18;
+    let y = 18;
+    pdf.setFontSize(18);
+    pdf.text('PARCEL SHEET', left, y);
+    y += 10;
+    pdf.setFontSize(10);
+    pdf.text(`Order: ${order.orderId}`, left, y);
+    pdf.text(`Status: ${getOrderStatus(order)}`, 110, y);
+    y += 6;
+    pdf.text(`Order date: ${new Date(order.createdAt).toLocaleString()}`, left, y);
+    y += 12;
+
+    const drawParty = (title: string, party: ParcelParty, x: number) => {
+      pdf.setFontSize(12);
+      pdf.setFont('helvetica', 'bold');
+      pdf.text(title, x, y);
+      pdf.setFont('helvetica', 'normal');
+      pdf.setFontSize(10);
+      const addressLines = [
+        party.fullName,
+        party.phone,
+        party.addressLine1,
+        party.addressLine2,
+        [party.city, party.state, party.pincode].filter(Boolean).join(', '),
+        party.country,
+      ].filter(Boolean).flatMap(line => pdf.splitTextToSize(line, 78));
+      pdf.text(addressLines, x, y + 7);
+    };
+
+    drawParty('FROM', from, left);
+    drawParty('TO', to, 110);
+    y += 52;
+    pdf.setFontSize(12);
+    pdf.setFont('helvetica', 'bold');
+    pdf.text('ORDER CONTENTS', left, y);
+    y += 7;
+    pdf.setFont('helvetica', 'normal');
+    pdf.setFontSize(10);
+    order.items.forEach(item => {
+      const lines = pdf.splitTextToSize(`${item.name}  x${item.quantity}  Rs ${item.price * item.quantity}`, 170);
+      if (y + lines.length * 5 > 275) {
+        pdf.addPage();
+        y = 18;
+      }
+      pdf.text(lines, left, y);
+      y += lines.length * 5 + 2;
+    });
+    y += 3;
+    pdf.setFont('helvetica', 'bold');
+    pdf.text(`Items total: Rs ${order.itemTotal}`, left, y);
+    if (order.courierBill) pdf.text(`Courier charge: Rs ${order.courierBill.amount}`, 110, y);
+    pdf.save(`parcel-${order.orderId}.pdf`);
+  };
+
+  const partyFields: Array<[keyof ParcelParty, string]> = [
+    ['fullName', 'Name'],
+    ['phone', 'Phone'],
+    ['addressLine1', 'Address line 1'],
+    ['addressLine2', 'Address line 2 / landmark'],
+    ['city', 'City'],
+    ['state', 'State'],
+    ['pincode', 'Pincode'],
+    ['country', 'Country'],
+  ];
+
+  return (
+    <details style={{ marginTop: '0.8rem', border: '1px solid #ddd', borderRadius: '6px', padding: '0.7rem' }}>
+      <summary style={{ cursor: 'pointer', fontWeight: 'bold' }}>Parcel sheet · From / To</summary>
+      <form onSubmit={save} style={{ marginTop: '0.8rem' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(230px, 1fr))', gap: '1rem' }}>
+          {(['from', 'to'] as const).map(side => (
+            <fieldset key={side} style={{ display: 'grid', gap: '0.5rem', border: '1px solid #ddd', padding: '0.75rem', minWidth: 0 }}>
+              <legend style={{ fontWeight: 'bold' }}>{side === 'from' ? 'FROM · Host' : 'TO · Customer'}</legend>
+              {partyFields.map(([field, label]) => (
+                <label key={field} style={{ display: 'grid', gap: '0.2rem', fontSize: '0.85rem' }}>
+                  {label}
+                  <input value={side === 'from' ? from[field] : to[field]} onChange={event => updateParty(side, field, event.target.value)} required={['fullName', 'phone', 'addressLine1', 'pincode'].includes(field)} />
+                </label>
+              ))}
+            </fieldset>
+          ))}
+        </div>
+        {order.parcelDetails && <p style={{ color: '#666', fontSize: '0.8rem' }}>Last saved by {order.parcelDetails.savedBy} · {new Date(order.parcelDetails.savedAt).toLocaleString()}</p>}
+        {error && <p role="alert" style={{ color: '#b00020' }}>{error}</p>}
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', marginTop: '0.8rem' }}>
+          <button type="submit" disabled={saving || saved} style={{ backgroundColor: '#6e1a3a', color: '#fff', border: 0, padding: '0.55rem 0.8rem', borderRadius: '4px', cursor: 'pointer' }}>
+            {saving ? 'Saving...' : saved ? 'Saved' : 'Save parcel details'}
+          </button>
+          <button type="button" disabled={!saved} onClick={downloadPdf} style={{ backgroundColor: '#2e7d32', color: '#fff', border: 0, padding: '0.55rem 0.8rem', borderRadius: '4px', cursor: saved ? 'pointer' : 'not-allowed' }}>
+            Download parcel PDF
+          </button>
+        </div>
+      </form>
+    </details>
+  );
+}
 
 function readVideoDuration(file: File): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -165,6 +471,7 @@ export default function App() {
   const [courierPolicyAccepted, setCourierPolicyAccepted] = useState(false);
   const [isCheckoutOpen, setIsCheckoutOpen] = useState(false);
   const [activeOrders, setActiveOrders] = useState<Order[]>([]);
+  const [hostOrderTab, setHostOrderTab] = useState<HostOrderTab>('ACTIVE');
   const [customerTab, setCustomerTab] = useState<'SHOP' | 'ORDERS'>('SHOP');
 
   // Customer Form Data
@@ -488,22 +795,43 @@ export default function App() {
     }
   };
 
-  const handleCourierReceipt = async (orderId: string) => {
-    const bill = {
-      courierName: 'DTDC Courier',
-      trackingId: 'DT98210391',
-      amount: 180,
-      receiptPhotoUrl: '',
-    };
+  const handleCourierReceipt = async (
+    orderId: string,
+    bill: Omit<CourierBill, 'billId'>,
+    screenshot: File | null,
+  ) => {
     try {
+      const currentBill = activeOrders.find(order => order.orderId === orderId)?.courierBill;
+      const receiptPhotoUrl = screenshot
+        ? firebaseConfigured
+          ? await uploadCourierTrackerImage(orderId, screenshot)
+          : URL.createObjectURL(screenshot)
+        : currentBill?.receiptPhotoUrl || '';
+      const updatedBill = { ...bill, receiptPhotoUrl };
       if (firebaseConfigured) {
-        await attachCloudCourierBill(orderId, bill);
+        await attachCloudCourierBill(orderId, updatedBill);
       } else {
-        globalOrderBook.attachCourierBill(orderId, bill);
+        globalOrderBook.attachCourierBill(orderId, updatedBill);
         setActiveOrders([...globalOrderBook.getAllOrders()]);
       }
     } catch (error) {
       setSyncError(error instanceof Error ? error.message : 'Could not attach courier receipt.');
+      throw error;
+    }
+  };
+
+  const handleCourierPayment = async (orderId: string, utr: string) => {
+    try {
+      if (firebaseConfigured) {
+        if (!firebaseUser) throw new Error('Sign in before submitting payment.');
+        await submitCloudCourierPayment(orderId, firebaseUser.uid, utr);
+      } else {
+        globalOrderBook.submitCourierPayment(orderId, userEmail, utr);
+        setActiveOrders([...globalOrderBook.getAllOrders()]);
+      }
+    } catch (error) {
+      setSyncError(error instanceof Error ? error.message : 'Could not submit courier payment.');
+      throw error;
     }
   };
 
@@ -520,9 +848,71 @@ export default function App() {
     }
   };
 
+  const handleNotAccepted = async (orderId: string) => {
+    try {
+      if (firebaseConfigured) {
+        await markCloudOrderNotAccepted(orderId);
+      } else {
+        globalOrderBook.markNotAccepted(orderId);
+        setActiveOrders([...globalOrderBook.getAllOrders()]);
+      }
+    } catch (error) {
+      setSyncError(error instanceof Error ? error.message : 'Could not update order status.');
+    }
+  };
+
+  const handleDelivered = async (orderId: string) => {
+    try {
+      if (firebaseConfigured) {
+        await markCloudOrderDelivered(orderId);
+      } else {
+        globalOrderBook.markDelivered(orderId);
+        setActiveOrders([...globalOrderBook.getAllOrders()]);
+      }
+    } catch (error) {
+      setSyncError(error instanceof Error ? error.message : 'Could not mark order delivered.');
+    }
+  };
+
+  const handleSaveParcel = async (orderId: string, from: ParcelParty, to: ParcelParty) => {
+    const parcelDetails: ParcelDetails = {
+      from,
+      to,
+      savedAt: new Date().toISOString(),
+      savedBy: firebaseUser?.email || userEmail,
+    };
+    try {
+      if (firebaseConfigured) {
+        await saveCloudParcelDetails(orderId, parcelDetails);
+      } else {
+        globalOrderBook.saveParcelDetails(orderId, parcelDetails);
+        setActiveOrders([...globalOrderBook.getAllOrders()]);
+      }
+    } catch (error) {
+      setSyncError(error instanceof Error ? error.message : 'Could not save parcel details.');
+      throw error;
+    }
+  };
+
   const filteredProducts = categoryFilter === 'All'
     ? products
     : products.filter(p => p.category === categoryFilter);
+
+  const firstInFirstOut = (left: Order, right: Order) => left.createdAt.localeCompare(right.createdAt);
+  const hostActiveOrders = activeOrders
+    .filter(order => !['SUBMITTED_FOR_DISPATCH', 'DELIVERED', 'NOT_ACCEPTED', 'CANCELLED'].includes(order.stage))
+    .sort(firstInFirstOut);
+  const hostDispatchedOrders = activeOrders
+    .filter(order => order.stage === 'SUBMITTED_FOR_DISPATCH')
+    .sort(firstInFirstOut);
+  const hostHistoryOrders = activeOrders
+    .filter(order => ['DELIVERED', 'NOT_ACCEPTED', 'CANCELLED'].includes(order.stage))
+    .sort(firstInFirstOut);
+  const hostVisibleOrders = hostOrderTab === 'ACTIVE'
+    ? hostActiveOrders
+    : hostOrderTab === 'DISPATCHED'
+      ? hostDispatchedOrders
+      : hostHistoryOrders;
 
   return (
     <div style={{ fontFamily: 'Georgia, serif', backgroundColor: '#fdf8f6', color: '#333', minHeight: '100vh' }}>
@@ -671,44 +1061,67 @@ export default function App() {
 
             {/* Manage Incoming Orders */}
             <h3>Incoming Orders & Courier Billing</h3>
-            {activeOrders.length === 0 ? (
+            <div role="tablist" aria-label="Host order queues" style={{ display: 'flex', gap: '0.4rem', borderBottom: '1px solid #ddd', margin: '0.8rem 0 1rem' }}>
+              {([
+                ['ACTIVE', `Active (${hostActiveOrders.length})`],
+                ['DISPATCHED', `Dispatched (${hostDispatchedOrders.length})`],
+                ['HISTORY', `History (${hostHistoryOrders.length})`],
+              ] as const).map(([tab, label]) => (
+                <button key={tab} type="button" role="tab" aria-selected={hostOrderTab === tab} onClick={() => setHostOrderTab(tab)} style={{ padding: '0.65rem 0.8rem', border: 0, borderBottom: hostOrderTab === tab ? '3px solid #6e1a3a' : '3px solid transparent', background: 'transparent', color: '#6e1a3a', fontWeight: 'bold', cursor: 'pointer' }}>
+                  {label}
+                </button>
+              ))}
+            </div>
+            <p style={{ color: '#666', fontSize: '0.85rem' }}>Active orders are listed oldest first. Times are shown in your local timezone.</p>
+            {hostVisibleOrders.length === 0 ? (
               <p style={{ color: '#666', fontStyle: 'italic' }}>
-                {firebaseConfigured ? 'Customer orders will appear here as they are submitted.' : 'No customer orders placed yet. Switch to Customer View to place a test order.'}
+                {hostOrderTab === 'ACTIVE' && firebaseConfigured ? 'Incoming orders will appear here as customers submit them.' : 'No orders in this section.'}
               </p>
-            ) : (
-              activeOrders.map(ord => (
-                <div key={ord.orderId} style={{ border: '1px solid #ddd', padding: '1rem', borderRadius: '8px', marginBottom: '1rem' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', fontWeight: 'bold' }}>
+            ) : hostVisibleOrders.map(ord => {
+              const canDispatch = Boolean(ord.itemPayment?.verified) && (!ord.courierBill || Boolean(ord.courierPayment?.verified));
+              return (
+                <article key={ord.orderId} style={{ border: '1px solid #ddd', padding: '1rem', borderRadius: '8px', marginBottom: '1rem' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', gap: '0.8rem', flexWrap: 'wrap', fontWeight: 'bold' }}>
                     <span>Order #{ord.orderId}</span>
-                    <span style={{ color: '#6e1a3a' }}>Stage: {ord.stage}</span>
+                    <span style={{ color: '#6e1a3a' }}>{getOrderStatus(ord)}</span>
                   </div>
-                  <p style={{ fontSize: '0.9rem', margin: '0.4rem 0' }}>Customer: {ord.address.fullName} ({ord.address.phone}) | UTR: <code>{ord.itemPayment?.utr}</code></p>
-                  
-                  <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.8rem' }}>
-                    <button 
-                      onClick={() => void handleVerifyPayment(ord.orderId, 'ITEM')}
-                      style={{ backgroundColor: '#2e7d32', color: '#fff', border: 'none', padding: '0.4rem 0.8rem', borderRadius: '4px', cursor: 'pointer' }}
-                    >
-                      {t.verifyPayment}
-                    </button>
-
-                    <button 
-                      onClick={() => void handleCourierReceipt(ord.orderId)}
-                      style={{ backgroundColor: '#0288d1', color: '#fff', border: 'none', padding: '0.4rem 0.8rem', borderRadius: '4px', cursor: 'pointer' }}
-                    >
-                      {t.uploadCourierReceipt} (₹180)
-                    </button>
-
-                    <button 
-                      onClick={() => void handleDispatch(ord.orderId)}
-                      style={{ backgroundColor: '#6e1a3a', color: '#fff', border: 'none', padding: '0.4rem 0.8rem', borderRadius: '4px', cursor: 'pointer' }}
-                    >
-                      {t.markDispatched}
-                    </button>
+                  <p style={{ fontSize: '0.85rem', margin: '0.45rem 0', color: '#555' }}>
+                    Received {new Date(ord.createdAt).toLocaleString()} · Updated {new Date(ord.updatedAt).toLocaleString()}
+                  </p>
+                  <p style={{ fontSize: '0.9rem', margin: '0.4rem 0' }}>Customer: {ord.address.fullName} ({ord.address.phone})</p>
+                  <ul style={{ margin: '0.5rem 0', paddingLeft: '1.2rem' }}>
+                    {ord.items.map((item, index) => <li key={`${item.productId}-${index}`}>{item.name} × {item.quantity} · ₹{item.price * item.quantity}</li>)}
+                  </ul>
+                  <p style={{ margin: '0.4rem 0', fontWeight: 'bold' }}>Items total: ₹{ord.itemTotal}</p>
+                  <ParcelSheet key={`${ord.orderId}-${ord.parcelDetails?.savedAt || 'new'}`} order={ord} onSave={handleSaveParcel} />
+                  {ord.itemPayment && (
+                    <div style={{ fontSize: '0.9rem', marginTop: '0.5rem' }}>
+                      Item payment: {ord.itemPayment.verified ? 'Confirmed' : 'Awaiting confirmation'} · UTR <code>{ord.itemPayment.utr}</code>
+                      {!ord.itemPayment.verified && <button type="button" onClick={() => void handleVerifyPayment(ord.orderId, 'ITEM')} style={{ marginLeft: '0.5rem' }}>{t.verifyPayment}</button>}
+                    </div>
+                  )}
+                  {ord.courierBill && (
+                    <div style={{ marginTop: '0.6rem', padding: '0.7rem', background: '#f5f8fa', borderRadius: '5px' }}>
+                      <strong>Courier charge: ₹{ord.courierBill.amount}</strong>
+                      <span> · {ord.courierBill.courierName} · Tracking {ord.courierBill.trackingId}</span>
+                      {ord.courierBill.receiptPhotoUrl && <div><a href={ord.courierBill.receiptPhotoUrl} target="_blank" rel="noreferrer">View courier tracker screenshot</a></div>}
+                      {ord.courierPayment && (
+                        <p style={{ margin: '0.4rem 0' }}>
+                          Customer UTR: <code>{ord.courierPayment.utr}</code> · {ord.courierPayment.verified ? 'Confirmed' : 'Awaiting host confirmation'}
+                          {!ord.courierPayment.verified && <button type="button" onClick={() => void handleVerifyPayment(ord.orderId, 'COURIER')} style={{ marginLeft: '0.5rem' }}>Confirm courier payment</button>}
+                        </p>
+                      )}
+                    </div>
+                  )}
+                  {hostOrderTab === 'ACTIVE' && <CourierBillForm key={`${ord.orderId}-${ord.courierBill?.billId || 'new'}`} order={ord} onSave={handleCourierReceipt} />}
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', marginTop: '0.8rem' }}>
+                    {hostOrderTab === 'ACTIVE' && <button type="button" disabled={!canDispatch} onClick={() => void handleDispatch(ord.orderId)} style={{ backgroundColor: '#6e1a3a', color: '#fff', border: 'none', padding: '0.45rem 0.8rem', borderRadius: '4px', cursor: canDispatch ? 'pointer' : 'not-allowed' }}>{t.markDispatched}</button>}
+                    {hostOrderTab === 'DISPATCHED' && <button type="button" onClick={() => void handleDelivered(ord.orderId)} style={{ backgroundColor: '#2e7d32', color: '#fff', border: 'none', padding: '0.45rem 0.8rem', borderRadius: '4px', cursor: 'pointer' }}>Mark delivered</button>}
+                    {hostOrderTab === 'ACTIVE' && <button type="button" onClick={() => { if (window.confirm('Mark this order as not accepted?')) void handleNotAccepted(ord.orderId); }} style={{ backgroundColor: '#fff', color: '#8b1e2d', border: '1px solid #8b1e2d', padding: '0.45rem 0.8rem', borderRadius: '4px', cursor: 'pointer' }}>Not accepted</button>}
                   </div>
-                </div>
-              ))
-            )}
+                </article>
+              );
+            })}
           </div>
         )}
 
@@ -890,7 +1303,7 @@ export default function App() {
                         <strong>Order #{ord.orderId}</strong>
                         <div style={{ color: '#666', fontSize: '0.85rem', marginTop: '0.2rem' }}>Placed {new Date(ord.createdAt).toLocaleString()}</div>
                       </div>
-                      <span style={{ color: '#6e1a3a', fontWeight: 'bold' }}>{ord.stage.replace(/_/g, ' ')}</span>
+                      <span style={{ color: '#6e1a3a', fontWeight: 'bold' }}>{getOrderStatus(ord)}</span>
                     </div>
                     <ul style={{ margin: '0.8rem 0', paddingLeft: '1.2rem' }}>
                       {ord.items.map((item, index) => (
@@ -908,6 +1321,7 @@ export default function App() {
                         <p style={{ margin: 0 }}>Courier Charge: <strong>₹{ord.courierBill.amount}</strong></p>
                       </div>
                     )}
+                    {ord.courierBill && <CourierPaymentForm order={ord} paymentQrUrl={paymentQrUrl} canSubmit={!firebaseConfigured || Boolean(firebaseUser)} onSubmit={handleCourierPayment} />}
                   </article>
                 ))}
               </section>

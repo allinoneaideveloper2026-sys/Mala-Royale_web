@@ -6,6 +6,7 @@ export type OrderStage =
   | 'COURIER_CHARGE_VERIFIED'
   | 'SUBMITTED_FOR_DISPATCH'
   | 'DELIVERED'
+  | 'NOT_ACCEPTED'
   | 'CANCELLED';
 
 export type UserRole = 'DEVELOPER' | 'OWNER' | 'CUSTOMER';
@@ -38,6 +39,24 @@ export interface CustomerAddress {
   consentTimestamp: string;
 }
 
+export interface ParcelParty {
+  fullName: string;
+  phone: string;
+  addressLine1: string;
+  addressLine2: string;
+  city: string;
+  state: string;
+  pincode: string;
+  country: string;
+}
+
+export interface ParcelDetails {
+  from: ParcelParty;
+  to: ParcelParty;
+  savedAt: string;
+  savedBy: string;
+}
+
 export interface PaymentRecord {
   paymentId: string;
   kind: 'ITEM' | 'COURIER';
@@ -45,6 +64,7 @@ export interface PaymentRecord {
   utr: string;
   screenshotUrl: string;
   verified: boolean;
+  submittedAt?: string;
 }
 
 export interface CourierBill {
@@ -64,6 +84,7 @@ export interface Order {
   isWithheld: boolean;
   courierNoticeAccepted: boolean;
   address: CustomerAddress;
+  parcelDetails?: ParcelDetails;
   itemPayment?: PaymentRecord;
   courierBill?: CourierBill;
   courierPayment?: PaymentRecord;

@@ -12,6 +12,13 @@ service firebase.storage {
       );
     }
 
+    function canReadOrder(orderId) {
+      return isStaff() || (
+        signedIn() &&
+        firestore.get(/databases/(default)/documents/orders/$(orderId)).data.userId == request.auth.uid
+      );
+    }
+
     match /products/{productId}/images/{fileName} {
       allow read: if true;
       allow write: if isStaff()
@@ -30,6 +37,13 @@ service firebase.storage {
       allow read: if true;
       allow write: if isStaff()
         && request.resource.size <= 5 * 1024 * 1024
+        && request.resource.contentType.matches('image/.*');
+    }
+
+    match /orders/{orderId}/courier-tracker/{fileName} {
+      allow read: if canReadOrder(orderId);
+      allow write: if isStaff()
+        && request.resource.size <= 10 * 1024 * 1024
         && request.resource.contentType.matches('image/.*');
     }
   }

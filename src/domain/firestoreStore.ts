@@ -1,6 +1,7 @@
 import {
   collection,
   deleteDoc,
+  deleteField,
   doc,
   getDoc,
   getDocs,
@@ -16,7 +17,7 @@ import {
 import { getDownloadURL, ref, uploadBytes, type FirebaseStorage } from 'firebase/storage';
 import { CONFIG } from '../config';
 import { firestore, storage } from '../firebase';
-import { CourierBill, CustomerAddress, Order, PaymentRecord, Product, ProductMedia } from './types';
+import { CourierBill, CustomerAddress, Order, ParcelDetails, PaymentRecord, Product, ProductMedia } from './types';
 
 function requireFirestore(): Firestore {
   if (!firestore) throw new Error('Firebase is not configured. Add the VITE_FIREBASE_* settings first.');
@@ -91,6 +92,17 @@ export async function uploadCheckoutQr(file: File): Promise<string> {
   const url = await getDownloadURL(fileRef);
   await setDoc(doc(db, 'settings', 'checkout'), { paymentQrUrl: url, updatedAt: new Date().toISOString() }, { merge: true });
   return url;
+}
+
+export async function uploadCourierTrackerImage(orderId: string, file: File): Promise<string> {
+  const bucket = requireStorage();
+  if (!file.type.startsWith('image/')) throw new Error('Choose an image screenshot for the courier tracker.');
+  if (file.size > 10 * 1024 * 1024) throw new Error('The courier tracker screenshot must be smaller than 10 MB.');
+
+  const extension = file.name.split('.').pop()?.toLowerCase().replace(/[^a-z0-9]/g, '') || 'jpg';
+  const fileRef = ref(bucket, `orders/${orderId}/courier-tracker/${createId()}.${extension}`);
+  await uploadBytes(fileRef, file, { contentType: file.type });
+  return getDownloadURL(fileRef);
 }
 
 export function subscribeOrders(
@@ -202,10 +214,47 @@ export async function verifyCloudPayment(orderId: string, kind: 'ITEM' | 'COURIE
 
 export async function attachCloudCourierBill(orderId: string, bill: Omit<CourierBill, 'billId'>): Promise<void> {
   const db = requireFirestore();
+  if (!Number.isFinite(bill.amount) || bill.amount <= 0) throw new Error('Courier amount must be greater than zero.');
   await updateDoc(doc(db, 'orders', orderId), {
     courierBill: { ...bill, billId: `CB-${createId()}` },
+    courierPayment: deleteField(),
     stage: 'COURIER_RECEIPT_UPLOADED',
     updatedAt: new Date().toISOString(),
+  });
+}
+
+export async function submitCloudCourierPayment(orderId: string, userId: string, utr: string): Promise<void> {
+  const db = requireFirestore();
+  const normalizedUtr = utr.trim();
+  if (!/^\d{12}$/.test(normalizedUtr)) throw new Error('Enter the 12-digit courier payment UTR.');
+  const orderRef = doc(db, 'orders', orderId);
+  const referenceId = await hashPaymentReference(normalizedUtr);
+  const paymentRef = doc(db, 'paymentReferences', referenceId);
+  const now = new Date().toISOString();
+
+  await runTransaction(db, async transaction => {
+    const [orderSnapshot, referenceSnapshot] = await Promise.all([
+      transaction.get(orderRef),
+      transaction.get(paymentRef),
+    ]);
+    if (!orderSnapshot.exists()) throw new Error('Order not found.');
+    if (referenceSnapshot.exists()) throw new Error('UTR has already been submitted for another payment.');
+    const order = orderSnapshot.data() as Order;
+    if (order.userId !== userId) throw new Error('This order does not belong to your account.');
+    if (!order.courierBill) throw new Error('The host has not added a courier charge yet.');
+    if (order.courierPayment) throw new Error('Courier payment has already been submitted.');
+
+    const payment: PaymentRecord = {
+      paymentId: `PAY-${createId()}`,
+      kind: 'COURIER',
+      amount: order.courierBill.amount,
+      utr: normalizedUtr,
+      screenshotUrl: '',
+      verified: false,
+      submittedAt: now,
+    };
+    transaction.update(orderRef, { courierPayment: payment, updatedAt: now });
+    transaction.set(paymentRef, { userId, orderId, createdAt: now });
   });
 }
 
@@ -215,8 +264,38 @@ export async function submitCloudOrderForDispatch(orderId: string): Promise<void
   await runTransaction(db, async transaction => {
     const snapshot = await transaction.get(orderRef);
     if (!snapshot.exists()) throw new Error('Order not found.');
-    if ((snapshot.data() as Order).isWithheld) throw new Error('Parcel is withheld by host.');
+    const order = snapshot.data() as Order;
+    if (order.isWithheld) throw new Error('Parcel is withheld by host.');
+    if (order.courierBill && !order.courierPayment?.verified) {
+      throw new Error('Courier payment must be confirmed before dispatch.');
+    }
     transaction.update(orderRef, { stage: 'SUBMITTED_FOR_DISPATCH', updatedAt: new Date().toISOString() });
+  });
+}
+
+export async function markCloudOrderNotAccepted(orderId: string): Promise<void> {
+  const db = requireFirestore();
+  await updateDoc(doc(db, 'orders', orderId), { stage: 'NOT_ACCEPTED', updatedAt: new Date().toISOString() });
+}
+
+export async function markCloudOrderDelivered(orderId: string): Promise<void> {
+  const db = requireFirestore();
+  const orderRef = doc(db, 'orders', orderId);
+  await runTransaction(db, async transaction => {
+    const snapshot = await transaction.get(orderRef);
+    if (!snapshot.exists()) throw new Error('Order not found.');
+    if ((snapshot.data() as Order).stage !== 'SUBMITTED_FOR_DISPATCH') {
+      throw new Error('Only dispatched orders can be marked delivered.');
+    }
+    transaction.update(orderRef, { stage: 'DELIVERED', updatedAt: new Date().toISOString() });
+  });
+}
+
+export async function saveCloudParcelDetails(orderId: string, parcelDetails: ParcelDetails): Promise<void> {
+  const db = requireFirestore();
+  await updateDoc(doc(db, 'orders', orderId), {
+    parcelDetails,
+    updatedAt: parcelDetails.savedAt,
   });
 }
 
