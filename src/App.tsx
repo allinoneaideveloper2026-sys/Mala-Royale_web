@@ -572,7 +572,7 @@ export default function App() {
   const [isUploadingQr, setIsUploadingQr] = useState(false);
 
   // Catalog State
-  const [products, setProducts] = useState<Product[]>(INITIAL_CATALOG);
+  const [products, setProducts] = useState<Product[]>(firebaseConfigured ? [] : INITIAL_CATALOG);
   const [categoryFilter, setCategoryFilter] = useState<string>('All');
   const [newProduct, setNewProduct] = useState({ name: '', category: 'Sarees', price: '', offerPrice: '', description: '', image: '' });
   const [productMediaFiles, setProductMediaFiles] = useState<File[]>([]);
@@ -646,6 +646,7 @@ export default function App() {
         setRole(nextRole);
         setSyncError('');
       } catch (err) {
+        console.error('Role check failed:', err);
         setRole('CUSTOMER');
         setSyncError(err instanceof Error ? err.message : 'Could not load account permissions.');
       } finally {
@@ -663,10 +664,6 @@ export default function App() {
     return subscribeProducts(nextProducts => {
       setSyncError('');
       setProducts(nextProducts);
-      if (nextProducts.length === 0 && (role === 'OWNER' || role === 'DEVELOPER') && !catalogSeedAttempted.current) {
-        catalogSeedAttempted.current = true;
-        void seedInitialProducts(INITIAL_CATALOG).catch(error => setSyncError(error.message));
-      }
     }, error => setSyncError(error.message));
   }, [role]);
 
