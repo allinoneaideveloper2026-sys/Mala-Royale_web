@@ -1,4 +1,4 @@
-import { Order, OrderStage, PaymentRecord, CourierBill, CustomerAddress, ParcelDetails, ProductMedia } from './types';
+import { Order, OrderStage, PaymentRecord, CourierBill, CustomerAddress, ParcelDetails } from './types';
 
 export class OrderBook {
   private orders: Map<string, Order> = new Map();
@@ -158,14 +158,6 @@ export class OrderBook {
     order.deliveryConfirmedAt = new Date().toISOString();
     order.deliveryConfirmedBy = email;
     order.updatedAt = order.deliveryConfirmedAt;
-    return order;
-  }
-
-  public addPackedParcelMedia(orderId: string, media: ProductMedia[]): Order {
-    const order = this.orders.get(orderId);
-    if (!order) throw new Error('Order not found');
-    order.packedParcelMedia = [...(order.packedParcelMedia || []), ...media];
-    order.updatedAt = new Date().toISOString();
     return order;
   }
 

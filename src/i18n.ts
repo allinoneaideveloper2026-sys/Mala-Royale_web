@@ -12,11 +12,9 @@ export interface TranslationDictionary {
   step1Address: string;
   step2Payment: string;
   step3Confirm: string;
-  uploadProof: string;
   enterUtr: string;
   placeOrder: string;
   verifyPayment: string;
-  uploadCourierReceipt: string;
   markDispatched: string;
   shareApp: string;
   reportIssue: string;
@@ -41,11 +39,9 @@ export const TRANSLATIONS: Record<Language, TranslationDictionary> = {
     step1Address: '1. Shipping Address',
     step2Payment: '2. Item Payment',
     step3Confirm: '3. Order Confirmation',
-    uploadProof: 'Upload Payment Screenshot',
     enterUtr: 'Enter 12-digit UTR Number',
-    placeOrder: 'Place Order & Submit Payment Proof',
+    placeOrder: 'Place Order & Submit UTR',
     verifyPayment: 'Verify Payment',
-    uploadCourierReceipt: 'Attach Courier Receipt & Charge',
     markDispatched: 'Submit for Dispatch',
     shareApp: 'Share App / Catalog',
     reportIssue: 'Report Bug / Suggest Feature',
@@ -68,11 +64,9 @@ export const TRANSLATIONS: Record<Language, TranslationDictionary> = {
     step1Address: '೧. ವಿಳಾಸ',
     step2Payment: '೨. ಪಾವತಿ',
     step3Confirm: '೩. ದೃಢೀಕರಣ ಮತ್ತು ಟ್ರ್ಯಾಕಿಂಗ್',
-    uploadProof: 'ಪಾವತಿ ಸ್ಕ್ರೀನ್‌ಶಾಟ್ ಅಪ್‌ಲೋಡ್ ಮಾಡಿ',
     enterUtr: 'UTR ಸಂಖ್ಯೆಯನ್ನು ನಮೂದಿಸಿ',
     placeOrder: 'ಆರ್ಡರ್ ಮಾಡಿ',
     verifyPayment: 'ಪಾವತಿಯನ್ನು ಪರಿಶೀಲಿಸಿ',
-    uploadCourierReceipt: 'ಕೊರಿಯರ್ ರಸೀದಿ ಅಪ್‌ಲೋಡ್ ಮಾಡಿ',
     markDispatched: 'ರವಾನೆಗೆ ಸಲ್ಲಿಸಿ',
     shareApp: 'ಅಪ್ಲಿಕೇಶನ್ ಹಂಚಿಕೊಳ್ಳಿ',
     reportIssue: 'ಸಮಸ್ಯೆಯನ್ನು ವರದಿ ಮಾಡಿ',

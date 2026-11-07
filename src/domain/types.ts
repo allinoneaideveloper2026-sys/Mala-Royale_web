@@ -92,7 +92,6 @@ export interface CourierBill {
   courierName: string;
   trackingId: string;
   amount: number;
-  receiptPhotoUrl: string;
 }
 
 export interface Order {
@@ -108,7 +107,6 @@ export interface Order {
   deliveryConfirmedAt?: string;
   deliveryConfirmedBy?: string;
   parcelDetails?: ParcelDetails;
-  packedParcelMedia?: ProductMedia[];
   itemPayment?: PaymentRecord;
   courierBill?: CourierBill;
   courierPayment?: PaymentRecord;

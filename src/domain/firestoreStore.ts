@@ -1,6 +1,5 @@
 import {
   collection,
-  arrayUnion,
   deleteDoc,
   deleteField,
   doc,
@@ -15,9 +14,8 @@ import {
   writeBatch,
   type Firestore,
 } from 'firebase/firestore';
-import { getDownloadURL, ref, uploadBytes, type FirebaseStorage } from 'firebase/storage';
 import { CONFIG } from '../config';
-import { firestore, storage } from '../firebase';
+import { firestore } from '../firebase';
 import { CourierBill, CustomerAddress, Order, ParcelDetails, PaymentRecord, PincodeCheck, Product, ProductMedia, SavedDeliveryAddress } from './types';
 
 function requireFirestore(): Firestore {
@@ -25,13 +23,44 @@ function requireFirestore(): Firestore {
   return firestore;
 }
 
-function requireStorage(): FirebaseStorage {
-  if (!storage) throw new Error('Firebase Storage is not configured. Add the storage bucket setting first.');
-  return storage;
-}
-
 function createId(): string {
   return crypto.randomUUID().replace(/-/g, '').slice(0, 12).toUpperCase();
+}
+
+interface CloudinaryUploadResponse {
+  secure_url?: unknown;
+  error?: { message?: unknown };
+}
+
+async function uploadToCloudinary(file: File, resourceType: 'image' | 'video'): Promise<string> {
+  const { cloudName, uploadPreset } = CONFIG.cloudinary;
+  if (!cloudName || !uploadPreset) {
+    throw new Error('Cloudinary is not configured. Add VITE_CLOUDINARY_CLOUD_NAME and VITE_CLOUDINARY_UPLOAD_PRESET.');
+  }
+
+  const formData = new FormData();
+  formData.append('file', file);
+  formData.append('upload_preset', uploadPreset);
+
+  const response = await fetch(`https://api.cloudinary.com/v1_1/${encodeURIComponent(cloudName)}/${resourceType}/upload`, {
+    method: 'POST',
+    body: formData,
+  });
+  let result: CloudinaryUploadResponse;
+  try {
+    result = await response.json() as CloudinaryUploadResponse;
+  } catch {
+    throw new Error(`Cloudinary returned an unreadable response (HTTP ${response.status}).`);
+  }
+
+  if (!response.ok) {
+    const message = typeof result.error?.message === 'string' ? result.error.message : `Cloudinary upload failed (HTTP ${response.status}).`;
+    throw new Error(message);
+  }
+  if (typeof result.secure_url !== 'string' || !result.secure_url.startsWith('https://')) {
+    throw new Error('Cloudinary did not return a valid secure media URL.');
+  }
+  return result.secure_url;
 }
 
 async function hashPaymentReference(value: string): Promise<string> {
@@ -62,15 +91,21 @@ export async function publishProduct(product: Product): Promise<void> {
   await setDoc(doc(db, 'products', product.id), product);
 }
 
-export async function uploadProductMedia(productId: string, files: File[]): Promise<ProductMedia[]> {
-  const bucket = requireStorage();
+export async function uploadProductMedia(files: File[]): Promise<ProductMedia[]> {
+  const videos = files.filter(file => file.type.startsWith('video/'));
+  const images = files.filter(file => file.type.startsWith('image/'));
+  if (files.length !== images.length + videos.length || images.length > 6 || videos.length > 1) {
+    throw new Error('Choose up to 6 photos and one product video.');
+  }
   return Promise.all(files.map(async file => {
     const type = file.type.startsWith('video/') ? 'video' : 'image';
-    const extension = file.name.split('.').pop()?.toLowerCase().replace(/[^a-z0-9]/g, '') || (type === 'video' ? 'mp4' : 'jpg');
-    const path = `products/${productId}/${type === 'video' ? 'videos' : 'images'}/${createId()}.${extension}`;
-    const fileRef = ref(bucket, path);
-    await uploadBytes(fileRef, file, { contentType: file.type });
-    return { url: await getDownloadURL(fileRef), type, name: file.name };
+    if (type === 'image' && (!file.type.startsWith('image/') || file.size > 10 * 1024 * 1024)) {
+      throw new Error('Each product photo must be an image smaller than 10 MB.');
+    }
+    if (type === 'video' && (!['video/mp4', 'video/webm', 'video/quicktime'].includes(file.type) || file.size > 50 * 1024 * 1024)) {
+      throw new Error('Use an MP4, WebM, or QuickTime video smaller than 50 MB.');
+    }
+    return { url: await uploadToCloudinary(file, type), type, name: file.name };
   }));
 }
 
@@ -82,28 +117,13 @@ export function subscribeCheckoutQr(onChange: (url: string) => void, onError: (e
 }
 
 export async function uploadCheckoutQr(file: File): Promise<string> {
-  const bucket = requireStorage();
   const db = requireFirestore();
   if (!file.type.startsWith('image/')) throw new Error('Choose an image file for the payment QR.');
   if (file.size > 5 * 1024 * 1024) throw new Error('The payment QR image must be smaller than 5 MB.');
 
-  const extension = file.name.split('.').pop()?.toLowerCase().replace(/[^a-z0-9]/g, '') || 'png';
-  const fileRef = ref(bucket, `settings/payment-qr/${createId()}.${extension}`);
-  await uploadBytes(fileRef, file, { contentType: file.type });
-  const url = await getDownloadURL(fileRef);
+  const url = await uploadToCloudinary(file, 'image');
   await setDoc(doc(db, 'settings', 'checkout'), { paymentQrUrl: url, updatedAt: new Date().toISOString() }, { merge: true });
   return url;
-}
-
-export async function uploadCourierTrackerImage(orderId: string, file: File): Promise<string> {
-  const bucket = requireStorage();
-  if (!file.type.startsWith('image/')) throw new Error('Choose an image screenshot for the courier tracker.');
-  if (file.size > 10 * 1024 * 1024) throw new Error('The courier tracker screenshot must be smaller than 10 MB.');
-
-  const extension = file.name.split('.').pop()?.toLowerCase().replace(/[^a-z0-9]/g, '') || 'jpg';
-  const fileRef = ref(bucket, `orders/${orderId}/courier-tracker/${createId()}.${extension}`);
-  await uploadBytes(fileRef, file, { contentType: file.type });
-  return getDownloadURL(fileRef);
 }
 
 export function subscribeOrders(
@@ -395,28 +415,6 @@ export async function confirmCloudOrderDelivery(orderId: string, email: string):
     deliveryConfirmedBy: email,
     updatedAt: new Date().toISOString(),
   });
-}
-
-export async function uploadPackedParcelImages(orderId: string, files: File[]): Promise<ProductMedia[]> {
-  const db = requireFirestore();
-  const bucket = requireStorage();
-  if (files.length === 0 || files.length > 5) throw new Error('Choose between 1 and 5 packed-parcel photos.');
-  if (files.some(file => !file.type.startsWith('image/') || file.size > 10 * 1024 * 1024)) {
-    throw new Error('Each packed-parcel photo must be an image smaller than 10 MB.');
-  }
-
-  const media = await Promise.all(files.map(async file => {
-    const extension = file.name.split('.').pop()?.toLowerCase().replace(/[^a-z0-9]/g, '') || 'jpg';
-    const fileRef = ref(bucket, `orders/${orderId}/packed-parcel/${createId()}.${extension}`);
-    await uploadBytes(fileRef, file, { contentType: file.type });
-    return { url: await getDownloadURL(fileRef), type: 'image' as const, name: file.name };
-  }));
-
-  await updateDoc(doc(db, 'orders', orderId), {
-    packedParcelMedia: arrayUnion(...media),
-    updatedAt: new Date().toISOString(),
-  });
-  return media;
 }
 
 export function isConfiguredDeveloper(email: string): boolean {
