@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { GoogleAuthProvider, onAuthStateChanged, signInWithPopup, signOut, type User } from 'firebase/auth';
 import { CONFIG } from './config';
 import { TRANSLATIONS, Language } from './i18n';
@@ -21,7 +21,6 @@ import {
   revokeHost,
   saveCloudDeliveryAddress,
   saveCloudParcelDetails,
-  seedInitialProducts,
   subscribeAuthorizedHosts,
   subscribeCheckoutQr,
   subscribeSavedAddresses,
@@ -30,8 +29,6 @@ import {
   submitCloudOrderForDispatch,
   submitCloudCourierPayment,
   uploadCheckoutQr,
-  uploadCourierTrackerImage,
-  uploadPackedParcelImages,
   uploadProductMedia,
   verifyCloudPayment,
 } from './domain/firestoreStore';
@@ -72,6 +69,20 @@ const LOGO_URL = 'https://res.cloudinary.com/yydehgmd/image/upload/w_400,q_auto,
 
 type HostOrderTab = 'ACTIVE' | 'DISPATCHED' | 'HISTORY';
 
+type CartLine = { product: Product; quantity: number };
+const MAX_CART_QUANTITY = 10;
+const unitPrice = (product: Product) => product.offerPrice || product.price;
+
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = window.setTimeout(() => reject(new Error(message)), ms);
+    promise.then(
+      value => { window.clearTimeout(timer); resolve(value); },
+      error => { window.clearTimeout(timer); reject(error); },
+    );
+  });
+}
+
 function getOrderStatus(order: Order): string {
   if (order.stage === 'NOT_ACCEPTED') return 'Not accepted';
   if (order.stage === 'CANCELLED') return 'Cancelled';
@@ -94,26 +105,17 @@ function CourierBillForm({
   onSave,
 }: {
   order: Order;
-  onSave: (orderId: string, bill: Omit<CourierBill, 'billId'>, screenshot: File | null) => Promise<void>;
+  onSave: (orderId: string, bill: Omit<CourierBill, 'billId'>) => Promise<void>;
 }) {
   const [courierName, setCourierName] = useState(order.courierBill?.courierName || '');
   const [trackingId, setTrackingId] = useState(order.courierBill?.trackingId || '');
   const [amount, setAmount] = useState(order.courierBill ? String(order.courierBill.amount) : '');
-  const [screenshot, setScreenshot] = useState<File | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
     if (!courierName.trim() || !trackingId.trim() || Number(amount) <= 0) return;
-    if (!screenshot && !order.courierBill?.receiptPhotoUrl) {
-      alert('Add a screenshot of the courier tracker before saving the bill.');
-      return;
-    }
-    if (screenshot && (!screenshot.type.startsWith('image/') || screenshot.size > 10 * 1024 * 1024)) {
-      setError('Choose an image screenshot smaller than 10 MB.');
-      return;
-    }
     setSaving(true);
     setError('');
     try {
@@ -121,9 +123,7 @@ function CourierBillForm({
         courierName: courierName.trim(),
         trackingId: trackingId.trim(),
         amount: Number(amount),
-        receiptPhotoUrl: order.courierBill?.receiptPhotoUrl || '',
-      }, screenshot);
-      setScreenshot(null);
+      });
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : 'Courier bill could not be saved.');
     } finally {
@@ -136,10 +136,6 @@ function CourierBillForm({
       <input aria-label="Courier name" placeholder="Courier name" value={courierName} onChange={event => setCourierName(event.target.value)} required />
       <input aria-label="Tracking ID" placeholder="Tracking ID" value={trackingId} onChange={event => setTrackingId(event.target.value)} required />
       <input aria-label="Courier amount in rupees" type="number" min="1" step="0.01" placeholder="Amount (₹)" value={amount} onChange={event => setAmount(event.target.value)} required />
-      <label style={{ display: 'grid', gap: '0.25rem', fontSize: '0.85rem' }}>
-        {order.courierBill?.receiptPhotoUrl ? 'Replace tracker screenshot (optional)' : 'Tracker screenshot *'}
-        <input type="file" accept="image/*" capture="environment" onChange={event => setScreenshot(event.target.files?.[0] || null)} />
-      </label>
       <button type="submit" disabled={saving} style={{ backgroundColor: '#0288d1', color: '#fff', border: 0, borderRadius: '4px', padding: '0.55rem 0.8rem', cursor: 'pointer', fontWeight: 'bold' }}>
         {saving ? 'Saving bill...' : order.courierBill ? 'Update courier bill' : 'Add courier bill'}
       </button>
@@ -182,7 +178,6 @@ function CourierPaymentForm({
   return (
     <div style={{ marginTop: '0.7rem', padding: '0.8rem', backgroundColor: '#f7f2ef', borderRadius: '6px' }}>
       <p style={{ margin: '0 0 0.35rem' }}>Courier charge: <strong>₹{order.courierBill.amount}</strong></p>
-      {order.courierBill.receiptPhotoUrl && <a href={order.courierBill.receiptPhotoUrl} target="_blank" rel="noreferrer">View courier tracker screenshot</a>}
       {paymentQrUrl && <img src={paymentQrUrl} alt="Courier payment QR" style={{ width: '150px', height: '150px', objectFit: 'contain', display: 'block', margin: '0.6rem 0' }} />}
       {order.courierPayment ? (
         <p role="status" style={{ marginBottom: 0, color: order.courierPayment.verified ? '#1b5e20' : '#8a4b08' }}>
@@ -264,52 +259,6 @@ function DeliveryAddressFields({
         )}
       </div>
     </>
-  );
-}
-
-function PackedParcelPhotos({
-  order,
-  onUpload,
-}: {
-  order: Order;
-  onUpload: (orderId: string, files: File[]) => Promise<void>;
-}) {
-  const [files, setFiles] = useState<File[]>([]);
-  const [uploading, setUploading] = useState(false);
-  const [error, setError] = useState('');
-
-  const upload = async () => {
-    if (files.length === 0 || uploading) return;
-    if (files.length > 5 || files.some(file => !file.type.startsWith('image/') || file.size > 10 * 1024 * 1024)) {
-      setError('Select up to 5 images, each smaller than 10 MB.');
-      return;
-    }
-    setUploading(true);
-    setError('');
-    try {
-      await onUpload(order.orderId, files);
-      setFiles([]);
-    } catch (uploadError) {
-      setError(uploadError instanceof Error ? uploadError.message : 'Could not upload parcel photos.');
-    } finally {
-      setUploading(false);
-    }
-  };
-
-  return (
-    <div style={{ marginTop: '0.8rem', padding: '0.8rem', border: '1px solid #ddd', borderRadius: '6px' }}>
-      <strong>Packed parcel photos</strong>
-      {order.packedParcelMedia?.length ? (
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', margin: '0.6rem 0' }}>
-          {order.packedParcelMedia.map((media, index) => <a key={`${media.url}-${index}`} href={media.url} target="_blank" rel="noreferrer"><img src={media.url} alt={`Packed parcel ${index + 1} for order ${order.orderId}`} style={{ width: '92px', height: '92px', objectFit: 'cover' }} /></a>)}
-        </div>
-      ) : <p style={{ margin: '0.35rem 0', color: '#666', fontSize: '0.85rem' }}>No packing photos added yet.</p>}
-      <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.5rem' }}>
-        <input type="file" accept="image/*" capture="environment" multiple onChange={event => setFiles(Array.from(event.target.files || []))} />
-        <button type="button" disabled={uploading || files.length === 0} onClick={() => void upload()} style={{ padding: '0.5rem 0.8rem' }}>{uploading ? 'Uploading...' : 'Upload packing photos'}</button>
-      </div>
-      {error && <p role="alert" style={{ color: '#b00020', marginBottom: 0 }}>{error}</p>}
-    </div>
   );
 }
 
@@ -567,7 +516,6 @@ export default function App() {
   const [authorizedHosts, setAuthorizedHosts] = useState<string[]>(CONFIG.ownerEmails);
   const [newHostEmail, setNewHostEmail] = useState('');
   const [grantHostAccess, setGrantHostAccess] = useState(true);
-  const catalogSeedAttempted = useRef(false);
   const [isUploadingProduct, setIsUploadingProduct] = useState(false);
   const [isUploadingQr, setIsUploadingQr] = useState(false);
 
@@ -580,7 +528,8 @@ export default function App() {
   const [paymentQrFile, setPaymentQrFile] = useState<File | null>(null);
 
   // Customer Cart & Checkout State
-  const [cart, setCart] = useState<Product[]>([]);
+  const [cart, setCart] = useState<CartLine[]>([]);
+  const [isCartOpen, setIsCartOpen] = useState(false);
   const [checkoutStep, setCheckoutStep] = useState<1 | 2 | 3>(1);
   const [courierPolicyAccepted, setCourierPolicyAccepted] = useState(false);
   const [isCheckoutOpen, setIsCheckoutOpen] = useState(false);
@@ -665,7 +614,7 @@ export default function App() {
       setSyncError('');
       setProducts(nextProducts);
     }, error => setSyncError(error.message));
-  }, [role]);
+  }, []);
 
   useEffect(() => {
     if (!firebaseConfigured) return;
@@ -750,6 +699,11 @@ export default function App() {
     }
   };
 
+  const confirmHostAction = (message: string) => {
+    if (typeof window === 'undefined') return true;
+    return window.confirm(`${message} This action requires host consent.`);
+  };
+
   // Developer Action: Add Host Email Whitelist
   const handleAddHost = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -760,6 +714,7 @@ export default function App() {
       return;
     }
     if (!authorizedHosts.some(host => host.toLowerCase() === normalizedEmail)) {
+      if (!confirmHostAction(`Authorize ${normalizedEmail} as a host?`)) return;
       try {
         if (firebaseConfigured) {
           await authorizeHost(normalizedEmail);
@@ -775,6 +730,8 @@ export default function App() {
   };
 
   const handleHostAccessToggle = async (email: string, enabled: boolean) => {
+    const action = enabled ? `Authorize ${email} as a host?` : `Revoke host access for ${email}?`;
+    if (!confirmHostAction(action)) return;
     try {
       if (enabled) {
         await authorizeHost(email);
@@ -805,11 +762,12 @@ export default function App() {
   const handlePublishProduct = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newProduct.name || !newProduct.price || isUploadingProduct) return;
+    if (!confirmHostAction(`Publish "${newProduct.name}" to the catalog?`)) return;
     setIsUploadingProduct(true);
     try {
       const productId = `p-${Date.now()}`;
       const media = firebaseConfigured
-        ? await uploadProductMedia(productId, productMediaFiles)
+        ? await withTimeout(uploadProductMedia(productMediaFiles), 120000, 'Uploading the photos is taking too long. Check your internet connection and try again.')
         : productMediaFiles.map(file => ({
           url: URL.createObjectURL(file),
           type: file.type.startsWith('video/') ? 'video' as const : 'image' as const,
@@ -827,7 +785,7 @@ export default function App() {
         media,
       };
       if (firebaseConfigured) {
-        await publishProduct(addedProduct);
+        await withTimeout(publishProduct(addedProduct), 60000, 'Saving the item is taking too long. Check your connection; if it does not appear in the catalog, try again.');
       } else {
         setProducts([addedProduct, ...products]);
       }
@@ -843,10 +801,11 @@ export default function App() {
 
   const handleCheckoutQrUpload = async () => {
     if (!paymentQrFile || isUploadingQr) return;
+    if (!confirmHostAction('Update the checkout QR for customers?')) return;
     setIsUploadingQr(true);
     try {
       const url = firebaseConfigured
-        ? await uploadCheckoutQr(paymentQrFile)
+        ? await withTimeout(uploadCheckoutQr(paymentQrFile), 60000, 'Saving the checkout QR is taking too long. Check your internet connection and try again.')
         : URL.createObjectURL(paymentQrFile);
       setPaymentQrUrl(url);
       setPaymentQrFile(null);
@@ -874,14 +833,28 @@ export default function App() {
   };
 
   // Cart Management
-  const addToCart = (p: Product) => setCart([...cart, p]);
+  const addToCart = (product: Product) => setCart(current => (
+    current.some(line => line.product.id === product.id)
+      ? current.map(line => line.product.id === product.id
+        ? { ...line, quantity: Math.min(line.quantity + 1, MAX_CART_QUANTITY) }
+        : line)
+      : [...current, { product, quantity: 1 }]
+  ));
+  const changeQuantity = (productId: string, delta: number) => setCart(current => current.flatMap(line => {
+    if (line.product.id !== productId) return [line];
+    const nextQuantity = Math.min(line.quantity + delta, MAX_CART_QUANTITY);
+    return nextQuantity <= 0 ? [] : [{ ...line, quantity: nextQuantity }];
+  }));
+  const removeFromCart = (productId: string) => setCart(current => current.filter(line => line.product.id !== productId));
   const buyNow = (product: Product) => {
-    setCart(currentCart => [...currentCart, product]);
+    addToCart(product);
     setCheckoutStep(1);
-    setIsCheckoutOpen(true);
+    setIsCheckoutOpen(false);
+    setIsCartOpen(true);
     setCustomerTab('SHOP');
   };
-  const cartTotal = cart.reduce((sum, item) => sum + (item.offerPrice || item.price), 0);
+  const cartCount = cart.reduce((count, line) => count + line.quantity, 0);
+  const cartTotal = cart.reduce((sum, line) => sum + unitPrice(line.product) * line.quantity, 0);
 
   // Customer Action: Submit Order via OrderBook Engine
   const handlePlaceOrder = async (e: React.FormEvent) => {
@@ -901,6 +874,11 @@ export default function App() {
       setCheckoutStep(1);
       return;
     }
+    if (cart.length === 0) {
+      alert('Your cart is empty. Add at least one item before placing an order.');
+      setIsCheckoutOpen(false);
+      return;
+    }
     if (!courierPolicyAccepted) {
       alert(t.acceptCourierNotice);
       return;
@@ -910,7 +888,7 @@ export default function App() {
       return;
     }
     try {
-      const orderItems = cart.map(i => ({ productId: i.id, name: i.name, price: i.offerPrice || i.price, quantity: 1 }));
+      const orderItems = cart.map(line => ({ productId: line.product.id, name: line.product.name, price: unitPrice(line.product), quantity: line.quantity }));
       const deliveryAddress: CustomerAddress = {
         ...address,
         street: [address.houseNameOrNumber, address.street1, address.street2].filter(Boolean).join(', '),
@@ -988,22 +966,9 @@ export default function App() {
     }
   };
 
-  const handlePackedParcelUpload = async (orderId: string, files: File[]) => {
-    try {
-      if (firebaseConfigured) {
-        await uploadPackedParcelImages(orderId, files);
-      } else {
-        const media: ProductMedia[] = files.map(file => ({ url: URL.createObjectURL(file), type: 'image', name: file.name }));
-        globalOrderBook.addPackedParcelMedia(orderId, media);
-        setActiveOrders([...globalOrderBook.getAllOrders()]);
-      }
-    } catch (error) {
-      setSyncError(error instanceof Error ? error.message : 'Could not upload packed-parcel photos.');
-      throw error;
-    }
-  };
-
   const handleVerifyPayment = async (orderId: string, kind: 'ITEM' | 'COURIER') => {
+    const paymentKindLabel = kind === 'ITEM' ? 'item payment' : 'courier payment';
+    if (!confirmHostAction(`Verify the ${paymentKindLabel} for order ${orderId}?`)) return;
     try {
       if (firebaseConfigured) {
         await verifyCloudPayment(orderId, kind);
@@ -1019,24 +984,16 @@ export default function App() {
   const handleCourierReceipt = async (
     orderId: string,
     bill: Omit<CourierBill, 'billId'>,
-    screenshot: File | null,
   ) => {
     try {
-      const currentBill = activeOrders.find(order => order.orderId === orderId)?.courierBill;
-      const receiptPhotoUrl = screenshot
-        ? firebaseConfigured
-          ? await uploadCourierTrackerImage(orderId, screenshot)
-          : URL.createObjectURL(screenshot)
-        : currentBill?.receiptPhotoUrl || '';
-      const updatedBill = { ...bill, receiptPhotoUrl };
       if (firebaseConfigured) {
-        await attachCloudCourierBill(orderId, updatedBill);
+        await attachCloudCourierBill(orderId, bill);
       } else {
-        globalOrderBook.attachCourierBill(orderId, updatedBill);
+        globalOrderBook.attachCourierBill(orderId, bill);
         setActiveOrders([...globalOrderBook.getAllOrders()]);
       }
     } catch (error) {
-      setSyncError(error instanceof Error ? error.message : 'Could not attach courier receipt.');
+      setSyncError(error instanceof Error ? error.message : 'Could not save courier bill.');
       throw error;
     }
   };
@@ -1057,6 +1014,7 @@ export default function App() {
   };
 
   const handleDispatch = async (orderId: string) => {
+    if (!confirmHostAction(`Mark order ${orderId} as dispatched?`)) return;
     try {
       if (firebaseConfigured) {
         await submitCloudOrderForDispatch(orderId);
@@ -1070,6 +1028,7 @@ export default function App() {
   };
 
   const handleNotAccepted = async (orderId: string) => {
+    if (!confirmHostAction(`Mark order ${orderId} as not accepted?`)) return;
     try {
       if (firebaseConfigured) {
         await markCloudOrderNotAccepted(orderId);
@@ -1083,6 +1042,7 @@ export default function App() {
   };
 
   const handleDelivered = async (orderId: string) => {
+    if (!confirmHostAction(`Mark order ${orderId} as delivered?`)) return;
     try {
       if (firebaseConfigured) {
         await markCloudOrderDelivered(orderId);
@@ -1272,7 +1232,7 @@ export default function App() {
         {/* DEVELOPER VIEW */}
         {/* ------------------------------------------------------------------------- */}
         {!firebaseLoading && role === 'DEVELOPER' && (
-          <div style={{ backgroundColor: '#fff', padding: '1.8rem', borderRadius: '10px', boxShadow: '0 2px 10px rgba(0,0,0,0.08)' }}>
+          <div style={{ backgroundColor: '#fff', padding: '1.8rem', borderRadius: '10px', boxShadow: '0 2px 10px rgba(0,0,0,0.08)', marginBottom: '2rem' }}>
             <h2 style={{ color: '#6e1a3a', marginTop: 0 }}>🛠️ Developer Telemetry & Host Access</h2>
             <p style={{ fontSize: '0.9rem' }}>App Version: <strong>{CONFIG.version}</strong> | Active Orders in Engine: <strong>{activeOrders.length}</strong></p>
             
@@ -1310,7 +1270,7 @@ export default function App() {
         )}
 
         {/* ------------------------------------------------------------------------- */}
-        {/* HOST / OWNER VIEW */}
+        {/* HOST / OWNER VIEW (also shown to the developer account) */}
         {/* ------------------------------------------------------------------------- */}
         {!firebaseLoading && (role === 'OWNER' || role === 'DEVELOPER') && (
           <div style={{ backgroundColor: '#fff', padding: '1.8rem', borderRadius: '10px', boxShadow: '0 2px 10px rgba(0,0,0,0.08)' }}>
@@ -1319,6 +1279,7 @@ export default function App() {
             {/* Catalog Upload Form */}
             <div style={{ backgroundColor: '#f7ebe8', padding: '1.2rem', borderRadius: '8px', marginBottom: '2rem' }}>
               <h3 style={{ margin: '0 0 1rem' }}>Upload New Catalog Item</h3>
+              {firebaseConfigured && (!CONFIG.cloudinary.cloudName || !CONFIG.cloudinary.uploadPreset) && <p role="status" style={{ color: '#8a4b08', fontSize: '0.85rem' }}>Configure VITE_CLOUDINARY_CLOUD_NAME and VITE_CLOUDINARY_UPLOAD_PRESET to upload product media. You can still use a hosted image URL.</p>}
               <form onSubmit={handlePublishProduct} style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '0.8rem' }}>
                 <input type="text" placeholder="Product Name *" value={newProduct.name} onChange={e => setNewProduct({ ...newProduct, name: e.target.value })} required style={{ padding: '0.6rem' }} />
                 <select value={newProduct.category} onChange={e => setNewProduct({ ...newProduct, category: e.target.value })} style={{ padding: '0.6rem' }}>
@@ -1356,6 +1317,7 @@ export default function App() {
             <div style={{ backgroundColor: '#fff', padding: '1.2rem', border: '1px solid #ddd', borderRadius: '8px', marginBottom: '2rem' }}>
               <h3 style={{ margin: '0 0 0.6rem' }}>Checkout Payment QR</h3>
               <p style={{ margin: '0 0 0.8rem', color: '#666', fontSize: '0.9rem' }}>Customers will see this QR during checkout.</p>
+              {firebaseConfigured && (!CONFIG.cloudinary.cloudName || !CONFIG.cloudinary.uploadPreset) && <p role="status" style={{ color: '#8a4b08', fontSize: '0.85rem' }}>Configure VITE_CLOUDINARY_CLOUD_NAME and VITE_CLOUDINARY_UPLOAD_PRESET in the deployment environment to upload images.</p>}
               {paymentQrUrl && <img src={paymentQrUrl} alt="Current checkout payment QR" style={{ width: '160px', height: '160px', objectFit: 'contain', display: 'block', marginBottom: '0.8rem' }} />}
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.7rem', alignItems: 'center' }}>
                 <input type="file" accept="image/*" onChange={handlePaymentQrSelection} />
@@ -1363,6 +1325,27 @@ export default function App() {
                   {isUploadingQr ? 'Uploading...' : 'Save checkout QR'}
                 </button>
               </div>
+            </div>
+
+            {/* Published catalog (read-only) */}
+            <div style={{ backgroundColor: '#fff', padding: '1.2rem', border: '1px solid #ddd', borderRadius: '8px', marginBottom: '2rem' }}>
+              <h3 style={{ margin: '0 0 0.6rem' }}>Published catalog ({products.length})</h3>
+              {products.length === 0 ? (
+                <p style={{ margin: 0, color: '#666', fontStyle: 'italic' }}>No items published yet.</p>
+              ) : (
+                <div style={{ display: 'grid', gap: '0.6rem' }}>
+                  {products.map(product => (
+                    <div key={product.id} style={{ display: 'flex', alignItems: 'center', gap: '0.8rem' }}>
+                      <img src={product.image} alt="" style={{ width: '48px', height: '48px', objectFit: 'cover', borderRadius: '4px', flex: '0 0 48px' }} />
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <strong>{product.name}</strong>
+                        <div style={{ fontSize: '0.85rem', color: '#666' }}>{product.category}</div>
+                      </div>
+                      <span style={{ fontWeight: 'bold', color: '#6e1a3a' }}>₹{unitPrice(product)}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
 
             {/* Manage Incoming Orders */}
@@ -1422,12 +1405,10 @@ export default function App() {
                       {!ord.itemPayment.verified && <button type="button" disabled={!ord.deliveryConfirmed} onClick={() => void handleVerifyPayment(ord.orderId, 'ITEM')} style={{ marginLeft: '0.5rem' }}>{t.verifyPayment}</button>}
                     </div>
                   )}
-                  <PackedParcelPhotos order={ord} onUpload={handlePackedParcelUpload} />
                   {ord.courierBill && (
                     <div style={{ marginTop: '0.6rem', padding: '0.7rem', background: '#f5f8fa', borderRadius: '5px' }}>
                       <strong>Courier charge: ₹{ord.courierBill.amount}</strong>
                       <span> · {ord.courierBill.courierName} · Tracking {ord.courierBill.trackingId}</span>
-                      {ord.courierBill.receiptPhotoUrl && <div><a href={ord.courierBill.receiptPhotoUrl} target="_blank" rel="noreferrer">View courier tracker screenshot</a></div>}
                       {ord.courierPayment && (
                         <p style={{ margin: '0.4rem 0' }}>
                           Customer UTR: <code>{ord.courierPayment.utr}</code> · {ord.courierPayment.verified ? 'Confirmed' : 'Awaiting host confirmation'}
@@ -1440,7 +1421,7 @@ export default function App() {
                   <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', marginTop: '0.8rem' }}>
                     {hostOrderTab === 'ACTIVE' && <button type="button" disabled={!canDispatch} onClick={() => void handleDispatch(ord.orderId)} style={{ backgroundColor: '#6e1a3a', color: '#fff', border: 'none', padding: '0.45rem 0.8rem', borderRadius: '4px', cursor: canDispatch ? 'pointer' : 'not-allowed' }}>{t.markDispatched}</button>}
                     {hostOrderTab === 'DISPATCHED' && <button type="button" onClick={() => void handleDelivered(ord.orderId)} style={{ backgroundColor: '#2e7d32', color: '#fff', border: 'none', padding: '0.45rem 0.8rem', borderRadius: '4px', cursor: 'pointer' }}>Mark delivered</button>}
-                    {hostOrderTab === 'ACTIVE' && <button type="button" onClick={() => { if (window.confirm('Mark this order as not accepted?')) void handleNotAccepted(ord.orderId); }} style={{ backgroundColor: '#fff', color: '#8b1e2d', border: '1px solid #8b1e2d', padding: '0.45rem 0.8rem', borderRadius: '4px', cursor: 'pointer' }}>Not accepted</button>}
+                    {hostOrderTab === 'ACTIVE' && <button type="button" onClick={() => void handleNotAccepted(ord.orderId)} style={{ backgroundColor: '#fff', color: '#8b1e2d', border: '1px solid #8b1e2d', padding: '0.45rem 0.8rem', borderRadius: '4px', cursor: 'pointer' }}>Not accepted</button>}
                   </div>
                 </article>
               );
@@ -1539,10 +1520,10 @@ export default function App() {
               </div>
 
               <button
-                onClick={() => setIsCheckoutOpen(true)}
+                onClick={() => setIsCartOpen(true)}
                 style={{ backgroundColor: '#6e1a3a', color: '#fff', border: 'none', padding: '0.6rem 1.4rem', borderRadius: '25px', fontWeight: 'bold', cursor: 'pointer' }}
               >
-                Order now · Cart ({cart.length}) · ₹{cartTotal}
+                View cart · {cartCount} item{cartCount === 1 ? '' : 's'} · ₹{cartTotal}
               </button>
             </div>
 
@@ -1588,6 +1569,61 @@ export default function App() {
               ))}
             </div>
 
+            {/* Cart Drawer */}
+            {isCartOpen && (
+              <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.6)', display: 'flex', justifyContent: 'center', alignItems: 'center', zIndex: 1000, padding: '1rem' }}>
+                <div role="dialog" aria-label="Shopping cart" style={{ backgroundColor: '#fff', maxWidth: '550px', width: '100%', maxHeight: '90vh', overflowY: 'auto', borderRadius: '12px', padding: '1.8rem', position: 'relative' }}>
+                  <button type="button" aria-label="Close cart" onClick={() => setIsCartOpen(false)} style={{ position: 'absolute', top: '15px', right: '15px', border: 'none', background: 'none', fontSize: '1.2rem', cursor: 'pointer' }}>✕</button>
+                  <h2 style={{ color: '#6e1a3a', marginTop: 0 }}>Your cart</h2>
+
+                  {cart.length === 0 ? (
+                    <div>
+                      <p>Your cart is empty.</p>
+                      <button type="button" onClick={() => setIsCartOpen(false)} style={{ backgroundColor: '#6e1a3a', color: '#fff', border: 'none', padding: '0.7rem 1rem', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}>Continue shopping</button>
+                    </div>
+                  ) : (
+                    <>
+                      <div style={{ display: 'grid', gap: '0.9rem' }}>
+                        {cart.map(line => (
+                          <div key={line.product.id} style={{ display: 'flex', gap: '0.8rem', alignItems: 'center', borderBottom: '1px solid #eee', paddingBottom: '0.9rem' }}>
+                            <img src={line.product.image} alt="" style={{ width: '64px', height: '64px', objectFit: 'cover', borderRadius: '6px', flex: '0 0 64px' }} />
+                            <div style={{ flex: 1, minWidth: 0 }}>
+                              <strong>{line.product.name}</strong>
+                              <div style={{ fontSize: '0.85rem', color: '#666' }}>₹{unitPrice(line.product)} each</div>
+                              <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.4rem', marginTop: '0.4rem' }}>
+                                <button type="button" aria-label={`Decrease quantity of ${line.product.name}`} onClick={() => changeQuantity(line.product.id, -1)} style={{ width: '30px', height: '30px', cursor: 'pointer' }}>−</button>
+                                <span aria-live="polite" style={{ minWidth: '1.5rem', textAlign: 'center', fontWeight: 'bold' }}>{line.quantity}</span>
+                                <button type="button" aria-label={`Increase quantity of ${line.product.name}`} disabled={line.quantity >= MAX_CART_QUANTITY} onClick={() => changeQuantity(line.product.id, 1)} style={{ width: '30px', height: '30px', cursor: line.quantity >= MAX_CART_QUANTITY ? 'not-allowed' : 'pointer' }}>+</button>
+                                <button type="button" onClick={() => removeFromCart(line.product.id)} style={{ marginLeft: '0.4rem', background: 'none', border: 'none', color: '#8b1e2d', textDecoration: 'underline', cursor: 'pointer' }}>Remove</button>
+                              </div>
+                            </div>
+                            <div style={{ fontWeight: 'bold', color: '#6e1a3a' }}>₹{unitPrice(line.product) * line.quantity}</div>
+                          </div>
+                        ))}
+                      </div>
+
+                      <div style={{ borderTop: '2px solid #6e1a3a', marginTop: '1rem', paddingTop: '0.8rem' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', gap: '1rem' }}>
+                          <span>Items ({cartCount})</span>
+                          <span>₹{cartTotal}</span>
+                        </div>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', gap: '1rem', marginTop: '0.4rem', fontWeight: 'bold', fontSize: '1.1rem' }}>
+                          <span>Order total</span>
+                          <span style={{ color: '#6e1a3a' }}>₹{cartTotal}</span>
+                        </div>
+                        <p style={{ color: '#666', fontSize: '0.8rem', marginBottom: 0 }}>Courier charges are billed separately after your order is confirmed.</p>
+                      </div>
+
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.6rem', marginTop: '1.2rem' }}>
+                        <button type="button" onClick={() => setIsCartOpen(false)} style={{ flex: '1 1 140px', backgroundColor: '#fff', color: '#6e1a3a', border: '1px solid #6e1a3a', padding: '0.7rem', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}>Continue shopping</button>
+                        <button type="button" onClick={() => { setIsCartOpen(false); setCheckoutStep(1); setIsCheckoutOpen(true); }} style={{ flex: '1 1 140px', backgroundColor: '#6e1a3a', color: '#fff', border: 'none', padding: '0.7rem', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}>Proceed to checkout</button>
+                      </div>
+                    </>
+                  )}
+                </div>
+              </div>
+            )}
+
             {/* 3-Step Checkout Drawer */}
             {isCheckoutOpen && (
               <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.6)', display: 'flex', justifyContent: 'center', alignItems: 'center', zIndex: 1000, padding: '1rem' }}>
@@ -1595,6 +1631,24 @@ export default function App() {
                   <button onClick={() => setIsCheckoutOpen(false)} style={{ position: 'absolute', top: '15px', right: '15px', border: 'none', background: 'none', fontSize: '1.2rem', cursor: 'pointer' }}>✕</button>
 
                   <h2 style={{ color: '#6e1a3a', marginTop: 0 }}>Checkout</h2>
+
+                  {/* Order Summary */}
+                  <div style={{ backgroundColor: '#f7f2ef', padding: '0.8rem', borderRadius: '6px', marginBottom: '1.2rem', fontSize: '0.9rem' }}>
+                    <strong>Order summary</strong>
+                    {cart.length === 0 ? (
+                      <p style={{ margin: '0.4rem 0 0' }}>Your cart is empty.</p>
+                    ) : cart.map(line => (
+                      <div key={line.product.id} style={{ display: 'flex', justifyContent: 'space-between', gap: '0.5rem', marginTop: '0.35rem' }}>
+                        <span>{line.product.name} × {line.quantity}</span>
+                        <span>₹{unitPrice(line.product) * line.quantity}</span>
+                      </div>
+                    ))}
+                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: '0.5rem', marginTop: '0.5rem', fontWeight: 'bold' }}>
+                      <span>Order total</span>
+                      <span>₹{cartTotal}</span>
+                    </div>
+                    <button type="button" onClick={() => { setIsCheckoutOpen(false); setIsCartOpen(true); }} style={{ marginTop: '0.5rem', padding: '0.35rem 0.7rem', cursor: 'pointer' }}>Edit cart</button>
+                  </div>
 
                   {/* Courier Policy Notice */}
                   <div style={{ backgroundColor: '#fff8e7', borderLeft: '4px solid #d97706', padding: '0.8rem', borderRadius: '4px', marginBottom: '1.2rem', fontSize: '0.85rem' }}>
@@ -1716,14 +1770,6 @@ export default function App() {
                         {ord.deliveryConfirmed ? `Host confirmed deliverable${ord.deliveryConfirmedAt ? ` · ${new Date(ord.deliveryConfirmedAt).toLocaleString()}` : ''}` : 'Waiting for host to confirm delivery serviceability'}
                       </p>
                     </div>
-                    {ord.packedParcelMedia && ord.packedParcelMedia.length > 0 && (
-                      <div style={{ margin: '0.7rem 0' }}>
-                        <strong>Packed parcel photos</strong>
-                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', marginTop: '0.4rem' }}>
-                          {ord.packedParcelMedia.map((media, index) => <a key={`${media.url}-${index}`} href={media.url} target="_blank" rel="noreferrer"><img src={media.url} alt={`Packed parcel ${index + 1} for order ${ord.orderId}`} style={{ width: '100px', height: '100px', objectFit: 'cover' }} /></a>)}
-                        </div>
-                      </div>
-                    )}
                     {ord.courierBill && (
                       <div style={{ marginTop: '0.6rem', backgroundColor: '#e8f5e9', padding: '0.8rem', borderRadius: '6px', fontSize: '0.9rem' }}>
                         <p style={{ margin: 0 }}>Courier: <strong>{ord.courierBill.courierName}</strong></p>
