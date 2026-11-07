@@ -1,8 +1,8 @@
-import React, { useEffect, useState } from 'react';
-import { GoogleAuthProvider, onAuthStateChanged, signInWithPopup, signOut, type User } from 'firebase/auth';
+import React, { useEffect, useMemo, useState } from 'react';
+import { GoogleAuthProvider, linkWithPopup, onAuthStateChanged, signInAnonymously, signInWithCredential, signInWithPopup, signOut, type User } from 'firebase/auth';
 import { CONFIG } from './config';
 import { TRANSLATIONS, Language } from './i18n';
-import { UserRole, Product, ProductMedia, Order, CourierBill, CustomerAddress, ParcelDetails, ParcelParty, PincodeCheck, SavedDeliveryAddress } from './domain/types';
+import { UserRole, Product, ProductMedia, ProductStatus, Order, CourierBill, CustomerAddress, ParcelDetails, ParcelParty, PincodeCheck, SavedDeliveryAddress } from './domain/types';
 import { globalOrderBook } from './domain/OrderBook';
 import { auth, firebaseConfigured } from './firebase';
 import {
@@ -12,6 +12,7 @@ import {
   createCloudOrder,
   confirmCloudOrderDelivery,
   deleteCloudDeliveryAddress,
+  deleteProduct,
   isAuthorizedHost,
   isConfiguredDeveloper,
   isConfiguredOwner,
@@ -28,6 +29,7 @@ import {
   subscribeProducts,
   submitCloudOrderForDispatch,
   submitCloudCourierPayment,
+  updateProduct,
   uploadCheckoutQr,
   uploadProductMedia,
   verifyCloudPayment,
@@ -72,6 +74,179 @@ type HostOrderTab = 'ACTIVE' | 'DISPATCHED' | 'HISTORY';
 type CartLine = { product: Product; quantity: number };
 const MAX_CART_QUANTITY = 10;
 const unitPrice = (product: Product) => product.offerPrice || product.price;
+
+const isPurchasable = (product: Product) => !product.status || product.status === 'AVAILABLE';
+
+const STATUS_LABELS: Record<ProductStatus, string> = {
+  AVAILABLE: 'Available',
+  OUT_OF_STOCK: 'Out of stock',
+  COMING_SOON: 'Coming soon',
+};
+
+const STATUS_COLORS: Record<ProductStatus, { backgroundColor: string; color: string }> = {
+  AVAILABLE: { backgroundColor: '#e8f5e9', color: '#1b5e20' },
+  OUT_OF_STOCK: { backgroundColor: '#fdecea', color: '#8b1e2d' },
+  COMING_SOON: { backgroundColor: '#fff3cd', color: '#664d03' },
+};
+
+const mediaButtonStyle: React.CSSProperties = {
+  backgroundColor: '#fff',
+  color: '#6e1a3a',
+  border: '1px solid #6e1a3a',
+  borderRadius: '20px',
+  padding: '0.5rem 0.9rem',
+  cursor: 'pointer',
+  fontWeight: 'bold',
+  fontSize: '0.9rem',
+};
+
+function whatsAppLink(phone: string, message: string): string {
+  const digits = phone.replace(/\D/g, '');
+  const withCountry = digits.length === 10 ? `91${digits}` : digits;
+  return `https://wa.me/${withCountry}?text=${encodeURIComponent(message)}`;
+}
+
+function GoogleIcon() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 48 48" aria-hidden="true" focusable="false">
+      <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z" />
+      <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z" />
+      <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z" />
+      <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z" />
+    </svg>
+  );
+}
+
+function GoogleSignInButton({ onClick, disabled, label }: { onClick: () => void; disabled?: boolean; label: string }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      style={{
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: '0.55rem',
+        backgroundColor: '#fff',
+        color: '#3c4043',
+        border: '1px solid #dadce0',
+        borderRadius: '999px',
+        padding: '0.4rem 1rem 0.4rem 0.7rem',
+        fontFamily: 'Arial, Helvetica, sans-serif',
+        fontSize: '0.85rem',
+        fontWeight: 600,
+        boxShadow: '0 1px 3px rgba(0,0,0,0.25)',
+        cursor: disabled ? 'not-allowed' : 'pointer',
+        opacity: disabled ? 0.7 : 1,
+      }}
+    >
+      <GoogleIcon />
+      {label}
+    </button>
+  );
+}
+
+function ProductManagerRow({
+  product,
+  onSave,
+  onDelete,
+}: {
+  product: Product;
+  onSave: (productId: string, changes: { name: string; price: number; offerPrice?: number; status: ProductStatus }) => Promise<void>;
+  onDelete: (product: Product) => Promise<void>;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [name, setName] = useState(product.name);
+  const [price, setPrice] = useState(String(product.price));
+  const [offerPrice, setOfferPrice] = useState(product.offerPrice ? String(product.offerPrice) : '');
+  const [status, setStatus] = useState<ProductStatus>(product.status || 'AVAILABLE');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const currentStatus: ProductStatus = product.status || 'AVAILABLE';
+
+  const openEditor = () => {
+    setName(product.name);
+    setPrice(String(product.price));
+    setOfferPrice(product.offerPrice ? String(product.offerPrice) : '');
+    setStatus(product.status || 'AVAILABLE');
+    setError('');
+    setEditing(true);
+  };
+
+  const save = async (event: React.FormEvent) => {
+    event.preventDefault();
+    const nextPrice = Number(price);
+    const nextOffer = offerPrice.trim() === '' ? undefined : Number(offerPrice);
+    if (!name.trim()) {
+      setError('Enter a product name.');
+      return;
+    }
+    if (!Number.isFinite(nextPrice) || nextPrice <= 0) {
+      setError('Enter a regular price greater than zero.');
+      return;
+    }
+    if (nextOffer !== undefined && (!Number.isFinite(nextOffer) || nextOffer <= 0 || nextOffer >= nextPrice)) {
+      setError('The offer price must be lower than the regular price.');
+      return;
+    }
+    setBusy(true);
+    setError('');
+    try {
+      await onSave(product.id, { name: name.trim(), price: nextPrice, offerPrice: nextOffer, status });
+      setEditing(false);
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : 'Could not save the changes.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const remove = async () => {
+    setBusy(true);
+    setError('');
+    try {
+      await onDelete(product);
+    } catch (deleteError) {
+      setError(deleteError instanceof Error ? deleteError.message : 'Could not remove the product.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div style={{ border: '1px solid #eee', borderRadius: '8px', padding: '0.7rem' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '0.8rem', flexWrap: 'wrap' }}>
+        <img src={product.image} alt="" style={{ width: '52px', height: '52px', objectFit: 'cover', borderRadius: '4px', flex: '0 0 52px' }} />
+        <div style={{ flex: '1 1 160px', minWidth: 0 }}>
+          <strong>{product.name}</strong>
+          <div style={{ fontSize: '0.85rem', color: '#666' }}>
+            {product.category} · ₹{unitPrice(product)}
+            {product.offerPrice ? <span style={{ textDecoration: 'line-through', marginLeft: '0.4rem', color: '#999' }}>₹{product.price}</span> : null}
+          </div>
+        </div>
+        <span style={{ ...STATUS_COLORS[currentStatus], fontSize: '0.75rem', fontWeight: 'bold', padding: '0.2rem 0.6rem', borderRadius: '999px' }}>{STATUS_LABELS[currentStatus]}</span>
+        <div style={{ display: 'flex', gap: '0.4rem' }}>
+          <button type="button" disabled={busy} onClick={editing ? () => setEditing(false) : openEditor} style={{ padding: '0.4rem 0.8rem', cursor: 'pointer' }}>{editing ? 'Cancel' : 'Edit'}</button>
+          <button type="button" disabled={busy} onClick={() => void remove()} style={{ padding: '0.4rem 0.8rem', backgroundColor: '#fff', color: '#8b1e2d', border: '1px solid #8b1e2d', borderRadius: '4px', cursor: 'pointer' }}>Remove</button>
+        </div>
+      </div>
+      {editing && (
+        <form onSubmit={save} style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: '0.6rem', marginTop: '0.7rem' }}>
+          <input aria-label="Product name" placeholder="Product name" value={name} onChange={event => setName(event.target.value)} required style={{ padding: '0.5rem' }} />
+          <input aria-label="Regular price" type="number" min="1" step="0.01" placeholder="Regular price (₹)" value={price} onChange={event => setPrice(event.target.value)} required style={{ padding: '0.5rem' }} />
+          <input aria-label="Offer price (optional)" type="number" min="1" step="0.01" placeholder="Offer price (₹, optional)" value={offerPrice} onChange={event => setOfferPrice(event.target.value)} style={{ padding: '0.5rem' }} />
+          <select aria-label="Availability" value={status} onChange={event => setStatus(event.target.value as ProductStatus)} style={{ padding: '0.5rem' }}>
+            <option value="AVAILABLE">Available</option>
+            <option value="OUT_OF_STOCK">Out of stock</option>
+            <option value="COMING_SOON">Coming soon</option>
+          </select>
+          <button type="submit" disabled={busy} style={{ backgroundColor: '#6e1a3a', color: '#fff', border: 0, borderRadius: '4px', padding: '0.5rem 0.8rem', cursor: 'pointer', fontWeight: 'bold' }}>{busy ? 'Saving...' : 'Save changes'}</button>
+        </form>
+      )}
+      {error && <p role="alert" style={{ color: '#b00020', margin: '0.5rem 0 0' }}>{error}</p>}
+    </div>
+  );
+}
 
 function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -215,7 +390,7 @@ function DeliveryAddressFields({
 }) {
   const fields: Array<{ key: keyof CustomerAddress; label: string; required?: boolean; numeric?: boolean }> = [
     { key: 'fullName', label: 'Customer name', required: true },
-    { key: 'phone', label: 'Phone number', required: true, numeric: true },
+    { key: 'phone', label: 'WhatsApp / phone number', required: true, numeric: true },
     { key: 'houseNameOrNumber', label: 'House name / number' },
     { key: 'street1', label: 'Street 1', required: true },
     { key: 'street2', label: 'Street 2', required: true },
@@ -228,7 +403,7 @@ function DeliveryAddressFields({
 
   return (
     <>
-      <p style={{ margin: 0, color: '#666', fontSize: '0.85rem' }}>Address details are collected only to deliver this order.</p>
+      <p style={{ margin: 0, color: '#666', fontSize: '0.85rem' }}>Address details are collected only to deliver this order. The host will use your WhatsApp number to confirm your order and share delivery updates.</p>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))', gap: '0.6rem' }}>
         {fields.map(field => (
           <label key={field.key} style={{ display: 'grid', gap: '0.2rem', fontSize: '0.85rem' }}>
@@ -528,8 +703,13 @@ export default function App() {
   const [paymentQrFile, setPaymentQrFile] = useState<File | null>(null);
 
   // Customer Cart & Checkout State
-  const [cart, setCart] = useState<CartLine[]>([]);
+  const [cartLines, setCart] = useState<CartLine[]>([]);
   const [isCartOpen, setIsCartOpen] = useState(false);
+  const [placedOrder, setPlacedOrder] = useState<{ orderId: string; total: number; phone: string; name: string } | null>(null);
+  const [orderCopied, setOrderCopied] = useState(false);
+  // Always price the cart from the live catalog so host price changes apply immediately.
+  const cart: CartLine[] = cartLines.map(line => ({ ...line, product: products.find(product => product.id === line.product.id) || line.product }));
+  const unavailableLines = cart.filter(line => !products.some(product => product.id === line.product.id) || !isPurchasable(line.product));
   const [checkoutStep, setCheckoutStep] = useState<1 | 2 | 3>(1);
   const [courierPolicyAccepted, setCourierPolicyAccepted] = useState(false);
   const [isCheckoutOpen, setIsCheckoutOpen] = useState(false);
@@ -563,7 +743,47 @@ export default function App() {
 
   const t = TRANSLATIONS[lang];
   const isStaff = role === 'OWNER' || role === 'DEVELOPER';
+  const googleUser = firebaseUser && !firebaseUser.isAnonymous ? firebaseUser : null;
   const [logoFailed, setLogoFailed] = useState(false);
+
+  const mediaPreviews = useMemo(() => productMediaFiles.map(file => ({
+    name: file.name,
+    url: URL.createObjectURL(file),
+    isVideo: file.type.startsWith('video/'),
+  })), [productMediaFiles]);
+  useEffect(() => () => mediaPreviews.forEach(preview => URL.revokeObjectURL(preview.url)), [mediaPreviews]);
+
+  const applySignedInUser = async (user: User | null) => {
+    setFirebaseUser(user);
+    setFirebaseLoading(true);
+
+    if (!user?.email) {
+      setUserEmail('');
+      setRole('CUSTOMER');
+      if (!user) setActiveOrders([]);
+      setFirebaseLoading(false);
+      return;
+    }
+
+    const email = user.email.toLowerCase();
+    setUserEmail(email);
+
+    try {
+      const nextRole = isConfiguredDeveloper(email)
+        ? 'DEVELOPER'
+        : isConfiguredOwner(email) || await isAuthorizedHost(email)
+          ? 'OWNER'
+          : 'CUSTOMER';
+      setRole(nextRole);
+      setSyncError('');
+    } catch (err) {
+      console.error('Role check failed:', err);
+      setRole('CUSTOMER');
+      setSyncError(err instanceof Error ? err.message : 'Could not load account permissions.');
+    } finally {
+      setFirebaseLoading(false);
+    }
+  };
 
   useEffect(() => {
     if (!auth) {
@@ -571,36 +791,8 @@ export default function App() {
       return;
     }
 
-    return onAuthStateChanged(auth, async user => {
-      setFirebaseUser(user);
-      setFirebaseLoading(true);
-
-      if (!user?.email) {
-        setUserEmail('');
-        setRole('CUSTOMER');
-        setActiveOrders([]);
-        setFirebaseLoading(false);
-        return;
-      }
-
-      const email = user.email.toLowerCase();
-      setUserEmail(email);
-
-      try {
-        const nextRole = isConfiguredDeveloper(email)
-          ? 'DEVELOPER'
-          : isConfiguredOwner(email) || await isAuthorizedHost(email)
-            ? 'OWNER'
-            : 'CUSTOMER';
-        setRole(nextRole);
-        setSyncError('');
-      } catch (err) {
-        console.error('Role check failed:', err);
-        setRole('CUSTOMER');
-        setSyncError(err instanceof Error ? err.message : 'Could not load account permissions.');
-      } finally {
-        setFirebaseLoading(false);
-      }
+    return onAuthStateChanged(auth, user => {
+      void applySignedInUser(user);
     }, error => {
       setFirebaseLoading(false);
       setSyncError(error.message);
@@ -647,11 +839,11 @@ export default function App() {
 
   useEffect(() => {
     if (firebaseConfigured) {
-      if (!firebaseUser) {
+      if (!googleUser) {
         setSavedAddresses([]);
         return;
       }
-      return subscribeSavedAddresses(firebaseUser.uid, addresses => {
+      return subscribeSavedAddresses(googleUser.uid, addresses => {
         setSavedAddresses(addresses);
         setSyncError('');
       }, error => setSyncError(error.message));
@@ -664,17 +856,49 @@ export default function App() {
       setSavedAddresses([]);
     }
     return undefined;
-  }, [firebaseUser, userEmail]);
+  }, [googleUser?.uid, userEmail]);
 
   const handleGoogleSignIn = async () => {
     if (!auth) return;
+    const provider = new GoogleAuthProvider();
+    // Always show the Google account chooser instead of silently using the primary account.
+    provider.setCustomParameters({ prompt: 'select_account' });
     try {
-      await signInWithPopup(auth, new GoogleAuthProvider());
+      const current = auth.currentUser;
+      if (current?.isAnonymous) {
+        try {
+          // Keep the guest's orders by attaching the Google account to the same session.
+          await linkWithPopup(current, provider);
+          await current.reload();
+          await current.getIdToken(true);
+          await applySignedInUser(auth.currentUser);
+          return;
+        } catch (linkError) {
+          const linkCode = (linkError as { code?: string })?.code;
+          if (linkCode === 'auth/credential-already-in-use') {
+            const credential = GoogleAuthProvider.credentialFromError(linkError as never);
+            if (credential) {
+              await signInWithCredential(auth, credential);
+              return;
+            }
+          }
+          throw linkError;
+        }
+      }
+      await signInWithPopup(auth, provider);
     } catch (error) {
       const code = (error as { code?: string })?.code;
       if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') return;
       setSyncError(error instanceof Error ? error.message : 'Google sign-in failed.');
     }
+  };
+
+  // Lets customers order without an account; a Google account can be linked later.
+  const ensureCustomerSession = async (): Promise<string> => {
+    if (firebaseUser) return firebaseUser.uid;
+    if (!auth) throw new Error('Sign-in is not available.');
+    const credential = await signInAnonymously(auth);
+    return credential.user.uid;
   };
 
   const handleSignOut = async () => {
@@ -832,8 +1056,41 @@ export default function App() {
     setPaymentQrFile(file);
   };
 
+  const removeProductMediaFile = (index: number) => setProductMediaFiles(files => files.filter((_, fileIndex) => fileIndex !== index));
+
+  // Host Action: Edit or remove a published product
+  const handleUpdateProduct = async (
+    productId: string,
+    changes: { name: string; price: number; offerPrice?: number; status: ProductStatus },
+  ) => {
+    try {
+      if (firebaseConfigured) {
+        await withTimeout(updateProduct(productId, changes), 30000, 'Saving the changes is taking too long. Check your internet connection and try again.');
+      } else {
+        setProducts(current => current.map(product => product.id === productId ? { ...product, ...changes } : product));
+      }
+    } catch (error) {
+      setSyncError(error instanceof Error ? error.message : 'Could not update the product.');
+      throw error;
+    }
+  };
+
+  const handleDeleteProduct = async (product: Product) => {
+    if (!confirmHostAction(`Remove "${product.name}" from the catalog?`)) return;
+    try {
+      if (firebaseConfigured) {
+        await withTimeout(deleteProduct(product.id), 30000, 'Removing the item is taking too long. Check your internet connection and try again.');
+      } else {
+        setProducts(current => current.filter(item => item.id !== product.id));
+      }
+    } catch (error) {
+      setSyncError(error instanceof Error ? error.message : 'Could not remove the product.');
+      throw error;
+    }
+  };
+
   // Cart Management
-  const addToCart = (product: Product) => setCart(current => (
+  const addToCart = (product: Product) => isPurchasable(product) && setCart(current => (
     current.some(line => line.product.id === product.id)
       ? current.map(line => line.product.id === product.id
         ? { ...line, quantity: Math.min(line.quantity + 1, MAX_CART_QUANTITY) }
@@ -883,11 +1140,23 @@ export default function App() {
       alert(t.acceptCourierNotice);
       return;
     }
-    if (firebaseConfigured && !firebaseUser) {
-      alert('Sign in with Google before placing an order.');
+    if (unavailableLines.length > 0) {
+      alert('Some items in your cart are no longer available. Please remove them and try again.');
+      setIsCheckoutOpen(false);
+      setIsCartOpen(true);
       return;
     }
     try {
+      let customerUid = firebaseUser?.uid || '';
+      if (firebaseConfigured && !customerUid) {
+        try {
+          customerUid = await ensureCustomerSession();
+        } catch (sessionError) {
+          console.error('Guest checkout session failed:', sessionError);
+          alert('We could not start a secure checkout. Please use the "Sign in with Google" button in this step and try again.');
+          return;
+        }
+      }
       const orderItems = cart.map(line => ({ productId: line.product.id, name: line.product.name, price: unitPrice(line.product), quantity: line.quantity }));
       const deliveryAddress: CustomerAddress = {
         ...address,
@@ -896,7 +1165,7 @@ export default function App() {
       };
       const order = firebaseConfigured
         ? await createCloudOrder(
-          firebaseUser!.uid,
+          customerUid,
           orderItems,
           cartTotal,
           deliveryAddress,
@@ -915,14 +1184,14 @@ export default function App() {
         globalOrderBook.submitItemPayment(order.orderId, cartTotal, utr, 'uploaded_proof.png');
         setActiveOrders(globalOrderBook.getAllOrders());
       }
-      if (saveAddressForLater) {
+      if (saveAddressForLater && (googleUser || !firebaseConfigured)) {
         const savedAddress: SavedDeliveryAddress = {
           ...deliveryAddress,
           id: selectedAddressId || `address-${Date.now()}`,
         };
         try {
-          if (firebaseConfigured && firebaseUser) {
-            await saveCloudDeliveryAddress(firebaseUser.uid, savedAddress);
+          if (firebaseConfigured && googleUser) {
+            await saveCloudDeliveryAddress(googleUser.uid, savedAddress);
           } else {
             const nextAddresses = [savedAddress, ...savedAddresses.filter(saved => saved.id !== savedAddress.id)];
             setSavedAddresses(nextAddresses);
@@ -933,10 +1202,12 @@ export default function App() {
         }
       }
       setCart([]);
+      setUtr('');
       setIsCheckoutOpen(false);
-      setCheckoutStep(3);
+      setCheckoutStep(1);
       setCustomerTab('ORDERS');
-      alert(`Order ${order.orderId} submitted successfully!`);
+      setOrderCopied(false);
+      setPlacedOrder({ orderId: order.orderId, total: cartTotal, phone: deliveryAddress.phone, name: deliveryAddress.fullName });
     } catch (err: any) {
       const message = err instanceof Error && err.message.includes('permission-denied')
         ? 'Firestore rejected this action. Check the deployed Firestore rules and signed-in account role.'
@@ -1103,8 +1374,8 @@ export default function App() {
     };
     try {
       if (firebaseConfigured) {
-        if (!firebaseUser) throw new Error('Sign in with Google to save delivery addresses.');
-        await saveCloudDeliveryAddress(firebaseUser.uid, savedAddress);
+        if (!googleUser) throw new Error('Sign in with Google to save delivery addresses.');
+        await saveCloudDeliveryAddress(googleUser.uid, savedAddress);
       } else {
         const nextAddresses = [savedAddress, ...savedAddresses.filter(saved => saved.id !== savedAddress.id)];
         setSavedAddresses(nextAddresses);
@@ -1122,8 +1393,8 @@ export default function App() {
   const handleDeleteDeliveryAddress = async (addressId: string) => {
     try {
       if (firebaseConfigured) {
-        if (!firebaseUser) throw new Error('Sign in with Google to manage delivery addresses.');
-        await deleteCloudDeliveryAddress(firebaseUser.uid, addressId);
+        if (!googleUser) throw new Error('Sign in with Google to manage delivery addresses.');
+        await deleteCloudDeliveryAddress(googleUser.uid, addressId);
       } else {
         const nextAddresses = savedAddresses.filter(saved => saved.id !== addressId);
         setSavedAddresses(nextAddresses);
@@ -1174,8 +1445,8 @@ export default function App() {
         <div>
           {isStaff || !firebaseConfigured ? (
             <span>Role: <strong>{firebaseConfigured ? firebaseLoading ? 'CHECKING ACCESS' : firebaseUser ? role === 'OWNER' ? 'HOST' : role : 'GUEST' : `LOCAL ${role === 'OWNER' ? 'HOST' : role}`}</strong> ({firebaseConfigured ? firebaseUser?.email || 'signed out' : userEmail})</span>
-          ) : firebaseUser ? (
-            <span>{firebaseUser.email}</span>
+          ) : googleUser ? (
+            <span>{googleUser.email}</span>
           ) : null}
         </div>
         <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center' }}>
@@ -1184,12 +1455,10 @@ export default function App() {
             <option value="kn">ಕನ್ನಡ (Kannada)</option>
           </select>
           {firebaseConfigured ? (
-            firebaseUser ? (
-              <button onClick={handleSignOut} style={{ padding: '0.35rem 0.7rem', cursor: 'pointer' }}>Sign out</button>
+            googleUser ? (
+              <button onClick={handleSignOut} style={{ padding: '0.35rem 0.9rem', cursor: 'pointer', borderRadius: '999px', border: '1px solid #dadce0', backgroundColor: '#fff', color: '#3c4043', fontWeight: 600 }}>Sign out</button>
             ) : (
-              <button onClick={handleGoogleSignIn} disabled={firebaseLoading} style={{ padding: '0.35rem 0.7rem', cursor: 'pointer' }}>
-                {firebaseLoading ? 'Checking session...' : 'Sign in with Google'}
-              </button>
+              <GoogleSignInButton onClick={() => void handleGoogleSignIn()} disabled={firebaseLoading} label={firebaseLoading ? 'Checking session...' : 'Sign in with Google'} />
             )
           ) : (
             <select value={userEmail} onChange={(e) => handleEmailSwitch(e.target.value)} style={{ padding: '0.25rem', borderRadius: '4px' }}>
@@ -1288,24 +1557,40 @@ export default function App() {
                 </select>
                 <input type="number" placeholder="Regular Price (₹) *" value={newProduct.price} onChange={e => setNewProduct({ ...newProduct, price: e.target.value })} required style={{ padding: '0.6rem' }} />
                 <input type="number" placeholder="Offer Price (₹, Optional)" value={newProduct.offerPrice} onChange={e => setNewProduct({ ...newProduct, offerPrice: e.target.value })} style={{ padding: '0.6rem' }} />
-                <input type="text" placeholder="Image URL" value={newProduct.image} onChange={e => setNewProduct({ ...newProduct, image: e.target.value })} style={{ padding: '0.6rem', gridColumn: '1 / -1' }} />
-                <div style={{ gridColumn: '1 / -1', display: 'flex', flexWrap: 'wrap', gap: '1rem' }}>
-                  <label style={{ display: 'grid', gap: '0.35rem' }}>
-                    Product photos and video
-                    <input type="file" accept="image/*,video/mp4,video/webm,video/quicktime" multiple onChange={handleProductMediaSelection} />
+                <div style={{ gridColumn: '1 / -1', display: 'grid', gap: '0.25rem' }}>
+                  <input type="text" placeholder="Optional: direct image link (ends in .jpg, .png or .webp)" value={newProduct.image} onChange={e => setNewProduct({ ...newProduct, image: e.target.value })} style={{ padding: '0.6rem' }} />
+                  <small style={{ color: '#666' }}>Only used when no photo is uploaded. Google Drive, Google Photos and Instagram page links do not work as image links, so upload the photo instead.</small>
+                </div>
+                <div style={{ gridColumn: '1 / -1', display: 'flex', flexWrap: 'wrap', gap: '0.6rem', alignItems: 'center' }}>
+                  <label style={mediaButtonStyle}>
+                    📷 Take photo
+                    <input type="file" accept="image/*" capture="environment" onChange={handleProductMediaSelection} style={{ display: 'none' }} />
                   </label>
-                  <label style={{ display: 'grid', gap: '0.35rem' }}>
-                    Capture a product photo
-                    <input type="file" accept="image/*" capture="environment" onChange={handleProductMediaSelection} />
+                  <label style={mediaButtonStyle}>
+                    🎥 Record video
+                    <input type="file" accept="video/*" capture="environment" onChange={handleProductMediaSelection} style={{ display: 'none' }} />
                   </label>
-                  <span style={{ alignSelf: 'end', color: '#666', fontSize: '0.85rem' }}>
-                    Up to 6 photos and one video (30 seconds max). {productMediaFiles.length ? `${productMediaFiles.length} file(s) selected.` : ''}
+                  <label style={mediaButtonStyle}>
+                    🖼️ Choose from gallery
+                    <input type="file" accept="image/*,video/mp4,video/webm,video/quicktime" multiple onChange={handleProductMediaSelection} style={{ display: 'none' }} />
+                  </label>
+                  <span style={{ color: '#666', fontSize: '0.8rem' }}>
+                    Up to 6 photos and one video (30 seconds max). The camera buttons open the camera on a phone; on a computer they open the file picker.
                   </span>
                 </div>
-                {productMediaFiles.length > 0 && (
-                  <ul style={{ gridColumn: '1 / -1', margin: 0, paddingLeft: '1.2rem', fontSize: '0.85rem' }}>
-                    {productMediaFiles.map((file, index) => <li key={`${file.name}-${index}`}>{file.name}</li>)}
-                  </ul>
+                {mediaPreviews.length > 0 && (
+                  <div style={{ gridColumn: '1 / -1', display: 'flex', flexWrap: 'wrap', gap: '0.7rem' }}>
+                    {mediaPreviews.map((preview, index) => (
+                      <div key={`${preview.name}-${index}`} style={{ position: 'relative', width: '84px', height: '84px' }}>
+                        {preview.isVideo ? (
+                          <video src={preview.url} muted playsInline style={{ width: '84px', height: '84px', objectFit: 'cover', borderRadius: '6px' }} />
+                        ) : (
+                          <img src={preview.url} alt={preview.name} style={{ width: '84px', height: '84px', objectFit: 'cover', borderRadius: '6px' }} />
+                        )}
+                        <button type="button" aria-label={`Remove ${preview.name}`} onClick={() => removeProductMediaFile(index)} style={{ position: 'absolute', top: '-6px', right: '-6px', width: '22px', height: '22px', borderRadius: '50%', border: 'none', background: '#8b1e2d', color: '#fff', cursor: 'pointer', lineHeight: 1 }}>✕</button>
+                      </div>
+                    ))}
+                  </div>
                 )}
                 <textarea placeholder="Product Description" value={newProduct.description} onChange={e => setNewProduct({ ...newProduct, description: e.target.value })} style={{ padding: '0.6rem', gridColumn: '1 / -1' }} />
                 <button type="submit" disabled={isUploadingProduct} style={{ backgroundColor: '#6e1a3a', color: '#fff', border: 'none', padding: '0.7rem', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold', gridColumn: '1 / -1' }}>
@@ -1327,22 +1612,21 @@ export default function App() {
               </div>
             </div>
 
-            {/* Published catalog (read-only) */}
+            {/* Manage catalog */}
             <div style={{ backgroundColor: '#fff', padding: '1.2rem', border: '1px solid #ddd', borderRadius: '8px', marginBottom: '2rem' }}>
-              <h3 style={{ margin: '0 0 0.6rem' }}>Published catalog ({products.length})</h3>
+              <h3 style={{ margin: '0 0 0.3rem' }}>Manage catalog ({products.length})</h3>
+              <p style={{ margin: '0 0 0.8rem', color: '#666', fontSize: '0.85rem' }}>Edit prices and offers, mark an item out of stock or coming soon, or remove it.</p>
               {products.length === 0 ? (
                 <p style={{ margin: 0, color: '#666', fontStyle: 'italic' }}>No items published yet.</p>
               ) : (
-                <div style={{ display: 'grid', gap: '0.6rem' }}>
+                <div style={{ display: 'grid', gap: '0.8rem' }}>
                   {products.map(product => (
-                    <div key={product.id} style={{ display: 'flex', alignItems: 'center', gap: '0.8rem' }}>
-                      <img src={product.image} alt="" style={{ width: '48px', height: '48px', objectFit: 'cover', borderRadius: '4px', flex: '0 0 48px' }} />
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <strong>{product.name}</strong>
-                        <div style={{ fontSize: '0.85rem', color: '#666' }}>{product.category}</div>
-                      </div>
-                      <span style={{ fontWeight: 'bold', color: '#6e1a3a' }}>₹{unitPrice(product)}</span>
-                    </div>
+                    <ProductManagerRow
+                      key={`${product.id}-${product.name}-${product.price}-${product.offerPrice ?? ''}-${product.status ?? ''}`}
+                      product={product}
+                      onSave={handleUpdateProduct}
+                      onDelete={handleDeleteProduct}
+                    />
                   ))}
                 </div>
               )}
@@ -1377,7 +1661,10 @@ export default function App() {
                   <p style={{ fontSize: '0.85rem', margin: '0.45rem 0', color: '#555' }}>
                     Received {new Date(ord.createdAt).toLocaleString()} · Updated {new Date(ord.updatedAt).toLocaleString()}
                   </p>
-                  <p style={{ fontSize: '0.9rem', margin: '0.4rem 0' }}>Customer: {ord.address.fullName} ({ord.address.phone})</p>
+                  <p style={{ fontSize: '0.9rem', margin: '0.4rem 0' }}>
+                    Customer: {ord.address.fullName} ({ord.address.phone}){' '}
+                    <a href={whatsAppLink(ord.address.phone, `Hello ${ord.address.fullName}, thank you for your order ${ord.orderId} at Mala Royale. We have received it and will update you shortly.`)} target="_blank" rel="noreferrer" style={{ marginLeft: '0.4rem', color: '#128c7e', fontWeight: 'bold' }}>WhatsApp customer</a>
+                  </p>
                   <div style={{ margin: '0.6rem 0', padding: '0.75rem', background: '#f7f2ef', borderRadius: '5px' }}>
                     <strong>Delivery address</strong>
                     <p style={{ margin: '0.35rem 0' }}>
@@ -1467,7 +1754,12 @@ export default function App() {
             {customerTab === 'ADDRESSES' && (
               <section aria-label="Saved delivery addresses">
                 <h2 style={{ color: '#6e1a3a', marginTop: 0 }}>Delivery addresses</h2>
-                {firebaseConfigured && !firebaseUser && <p role="status">Sign in with Google to save addresses to your account.</p>}
+                {firebaseConfigured && !googleUser && (
+                  <div style={{ marginBottom: '1rem' }}>
+                    <p role="status" style={{ marginTop: 0 }}>Sign in with Google to save addresses to your account.</p>
+                    <GoogleSignInButton onClick={() => void handleGoogleSignIn()} disabled={firebaseLoading} label="Sign in with Google" />
+                  </div>
+                )}
                 <div style={{ display: 'grid', gap: '0.7rem', marginBottom: '1.2rem' }}>
                   {savedAddresses.map(saved => (
                     <article key={saved.id} style={{ backgroundColor: '#fff', border: '1px solid #ddd', borderRadius: '6px', padding: '0.9rem' }}>
@@ -1549,20 +1841,26 @@ export default function App() {
                           <span style={{ fontSize: '1.1rem', fontWeight: 'bold', color: '#6e1a3a' }}>₹{product.price}</span>
                         )}
                       </div>
-                      <div style={{ display: 'flex', gap: '0.4rem' }}>
-                        <button
-                          onClick={() => addToCart(product)}
-                          style={{ backgroundColor: '#fff', color: '#6e1a3a', border: '1px solid #6e1a3a', padding: '0.45rem 0.65rem', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}
-                        >
-                          + Add
-                        </button>
-                        <button
-                          onClick={() => buyNow(product)}
-                          style={{ backgroundColor: '#6e1a3a', color: '#fff', border: 'none', padding: '0.45rem 0.65rem', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}
-                        >
-                          Buy now
-                        </button>
-                      </div>
+                      {isPurchasable(product) ? (
+                        <div style={{ display: 'flex', gap: '0.4rem' }}>
+                          <button
+                            onClick={() => addToCart(product)}
+                            style={{ backgroundColor: '#fff', color: '#6e1a3a', border: '1px solid #6e1a3a', padding: '0.45rem 0.65rem', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}
+                          >
+                            + Add
+                          </button>
+                          <button
+                            onClick={() => buyNow(product)}
+                            style={{ backgroundColor: '#6e1a3a', color: '#fff', border: 'none', padding: '0.45rem 0.65rem', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}
+                          >
+                            Buy now
+                          </button>
+                        </div>
+                      ) : (
+                        <span style={{ ...STATUS_COLORS[product.status || 'OUT_OF_STOCK'], fontSize: '0.85rem', fontWeight: 'bold', padding: '0.4rem 0.8rem', borderRadius: '999px' }}>
+                          {STATUS_LABELS[product.status || 'OUT_OF_STOCK']}
+                        </span>
+                      )}
                     </div>
                   </div>
                 </div>
@@ -1612,11 +1910,16 @@ export default function App() {
                           <span style={{ color: '#6e1a3a' }}>₹{cartTotal}</span>
                         </div>
                         <p style={{ color: '#666', fontSize: '0.8rem', marginBottom: 0 }}>Courier charges are billed separately after your order is confirmed.</p>
+                        {unavailableLines.length > 0 && (
+                          <p role="alert" style={{ color: '#8b1e2d', fontSize: '0.85rem', marginBottom: 0 }}>
+                            No longer available: {unavailableLines.map(line => line.product.name).join(', ')}. Please remove {unavailableLines.length === 1 ? 'it' : 'them'} to continue.
+                          </p>
+                        )}
                       </div>
 
                       <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.6rem', marginTop: '1.2rem' }}>
                         <button type="button" onClick={() => setIsCartOpen(false)} style={{ flex: '1 1 140px', backgroundColor: '#fff', color: '#6e1a3a', border: '1px solid #6e1a3a', padding: '0.7rem', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}>Continue shopping</button>
-                        <button type="button" onClick={() => { setIsCartOpen(false); setCheckoutStep(1); setIsCheckoutOpen(true); }} style={{ flex: '1 1 140px', backgroundColor: '#6e1a3a', color: '#fff', border: 'none', padding: '0.7rem', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}>Proceed to checkout</button>
+                        <button type="button" disabled={unavailableLines.length > 0} onClick={() => { setIsCartOpen(false); setCheckoutStep(1); setIsCheckoutOpen(true); }} style={{ flex: '1 1 140px', backgroundColor: '#6e1a3a', color: '#fff', border: 'none', padding: '0.7rem', borderRadius: '6px', cursor: unavailableLines.length > 0 ? 'not-allowed' : 'pointer', opacity: unavailableLines.length > 0 ? 0.6 : 1, fontWeight: 'bold' }}>Proceed to checkout</button>
                       </div>
                     </>
                   )}
@@ -1689,7 +1992,7 @@ export default function App() {
                         </div>
                       )}
                       {!useSavedAddress && <DeliveryAddressFields address={address} setAddress={setAddress} isCheckingPincode={isCheckingPincode} onCheckPincode={() => void handleCheckPincode()} />}
-                      {!useSavedAddress && (
+                      {!useSavedAddress && (googleUser || !firebaseConfigured) && (
                         <label style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', marginTop: '0.6rem' }}>
                           <input type="checkbox" checked={saveAddressForLater} onChange={event => setSaveAddressForLater(event.target.checked)} />
                           Save this address for next time
@@ -1708,7 +2011,14 @@ export default function App() {
                   {checkoutStep === 2 && (
                     <form onSubmit={handlePlaceOrder}>
                       <h3>{t.step2Payment} (₹{cartTotal})</h3>
-                      {firebaseConfigured && !firebaseUser && <p role="status">Sign in with Google before submitting your order.</p>}
+                      {firebaseConfigured && !googleUser && (
+                        <div style={{ backgroundColor: '#f1f8ff', border: '1px solid #cfe3f7', padding: '0.8rem', borderRadius: '6px', margin: '0.6rem 0', fontSize: '0.85rem' }}>
+                          <strong>No account needed.</strong> The host will confirm your order on WhatsApp{address.phone ? ` at ${address.phone}` : ''}. Sign in with Google (optional) to keep track of your orders on any device.
+                          <div style={{ marginTop: '0.5rem' }}>
+                            <GoogleSignInButton onClick={() => void handleGoogleSignIn()} disabled={firebaseLoading} label="Sign in with Google (optional)" />
+                          </div>
+                        </div>
+                      )}
                       <div style={{ backgroundColor: '#f7f2ef', padding: '1rem', borderRadius: '6px', margin: '0.8rem 0' }}>
                         <p style={{ marginTop: 0, fontSize: '0.9rem' }}>Scan the payment QR provided by the host, then enter your 12-digit UTR reference.</p>
                         {paymentQrUrl ? (
@@ -1725,7 +2035,7 @@ export default function App() {
                         required 
                         style={{ width: '100%', padding: '0.6rem', border: '1px solid #ccc', borderRadius: '4px', margin: '0.8rem 0' }} 
                       />
-                      <button type="submit" disabled={firebaseConfigured && !firebaseUser} style={{ backgroundColor: '#6e1a3a', color: '#fff', border: 'none', padding: '0.7rem', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', width: '100%' }}>{t.placeOrder}</button>
+                      <button type="submit" disabled={firebaseLoading} style={{ backgroundColor: '#6e1a3a', color: '#fff', border: 'none', padding: '0.7rem', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', width: '100%' }}>{t.placeOrder}</button>
                     </form>
                   )}
                 </div>
@@ -1737,9 +2047,15 @@ export default function App() {
             {customerTab === 'ORDERS' && (
               <section aria-label="Recent orders and tracking">
                 <h2 style={{ color: '#6e1a3a', marginTop: 0 }}>{t.myOrders}</h2>
+                {firebaseConfigured && !googleUser && (
+                  <div style={{ backgroundColor: '#f1f8ff', border: '1px solid #cfe3f7', padding: '0.8rem', borderRadius: '6px', marginBottom: '1rem', fontSize: '0.85rem', display: 'flex', flexWrap: 'wrap', gap: '0.6rem', alignItems: 'center', justifyContent: 'space-between' }}>
+                    <span>Placed an order before, or want to track orders from any device?</span>
+                    <GoogleSignInButton onClick={() => void handleGoogleSignIn()} disabled={firebaseLoading} label="Sign in with Google" />
+                  </div>
+                )}
                 {activeOrders.length === 0 ? (
                   <div style={{ backgroundColor: '#fff', padding: '1.5rem', borderRadius: '8px', border: '1px solid #eee' }}>
-                    <p style={{ marginTop: 0 }}>{firebaseConfigured && !firebaseUser ? 'Sign in to track your orders.' : 'No orders yet.'}</p>
+                    <p style={{ marginTop: 0 }}>{firebaseConfigured && !googleUser ? 'No orders on this device yet.' : 'No orders yet.'}</p>
                     <button type="button" onClick={() => setCustomerTab('SHOP')} style={{ backgroundColor: '#6e1a3a', color: '#fff', border: 0, padding: '0.6rem 1rem', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}>Browse the collection</button>
                   </div>
                 ) : activeOrders.map(ord => (
@@ -1781,6 +2097,35 @@ export default function App() {
                   </article>
                 ))}
               </section>
+            )}
+
+            {placedOrder && (
+              <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.6)', display: 'flex', justifyContent: 'center', alignItems: 'center', zIndex: 1100, padding: '1rem' }}>
+                <div role="dialog" aria-label="Order placed" style={{ backgroundColor: '#fff', maxWidth: '460px', width: '100%', maxHeight: '90vh', overflowY: 'auto', borderRadius: '12px', padding: '1.8rem', textAlign: 'center' }}>
+                  <div style={{ fontSize: '2.4rem' }} aria-hidden="true">✅</div>
+                  <h2 style={{ color: '#6e1a3a', margin: '0.3rem 0' }}>Order placed!</h2>
+                  <p style={{ margin: '0.3rem 0', color: '#555' }}>Thank you, {placedOrder.name}. Your order ID is:</p>
+                  <div style={{ fontFamily: 'monospace', fontSize: '1.3rem', fontWeight: 'bold', backgroundColor: '#f7f2ef', padding: '0.7rem', borderRadius: '6px', letterSpacing: '0.04em', wordBreak: 'break-all' }}>{placedOrder.orderId}</div>
+                  <button
+                    type="button"
+                    onClick={() => { void navigator.clipboard?.writeText(placedOrder.orderId).then(() => setOrderCopied(true)).catch(() => undefined); }}
+                    style={{ marginTop: '0.6rem', padding: '0.45rem 0.9rem', cursor: 'pointer' }}
+                  >
+                    {orderCopied ? 'Copied ✓' : 'Copy order ID'}
+                  </button>
+                  <p style={{ margin: '0.9rem 0 0.3rem', fontWeight: 'bold' }}>Order total: ₹{placedOrder.total}</p>
+                  <p style={{ color: '#666', fontSize: '0.85rem', margin: '0.3rem 0 1rem' }}>
+                    The host will verify your payment and confirm your order on WhatsApp at {placedOrder.phone}. Keep this order ID for any questions.
+                  </p>
+                  {firebaseConfigured && !googleUser && (
+                    <div style={{ marginBottom: '1rem' }}>
+                      <p style={{ color: '#666', fontSize: '0.8rem', margin: '0 0 0.5rem' }}>Want to track this order from any device?</p>
+                      <GoogleSignInButton onClick={() => void handleGoogleSignIn()} disabled={firebaseLoading} label="Sign in with Google" />
+                    </div>
+                  )}
+                  <button type="button" onClick={() => setPlacedOrder(null)} style={{ backgroundColor: '#6e1a3a', color: '#fff', border: 'none', padding: '0.7rem 1.2rem', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', width: '100%' }}>View my orders</button>
+                </div>
+              </div>
             )}
           </div>
         )}
