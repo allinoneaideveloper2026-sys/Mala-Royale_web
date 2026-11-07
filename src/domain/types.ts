@@ -17,6 +17,8 @@ export interface ProductMedia {
   name?: string;
 }
 
+export type ProductStatus = 'AVAILABLE' | 'OUT_OF_STOCK' | 'COMING_SOON';
+
 export interface Product {
   id: string;
   name: string;
@@ -26,6 +28,7 @@ export interface Product {
   description: string;
   image: string;
   media?: ProductMedia[];
+  status?: ProductStatus;
 }
 
 export interface CustomerAddress {
