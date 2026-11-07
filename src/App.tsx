@@ -68,6 +68,7 @@ const INITIAL_CATALOG: Product[] = [
 const MAX_PRODUCT_IMAGES = 6;
 const MAX_PRODUCT_VIDEOS = 1;
 const MAX_VIDEO_SECONDS = 30;
+const LOGO_URL = 'https://res.cloudinary.com/yydehgmd/image/upload/w_400,q_auto,f_auto/v1793990131/MalaRoyale.jpg';
 
 type HostOrderTab = 'ACTIVE' | 'DISPATCHED' | 'HISTORY';
 
@@ -612,6 +613,8 @@ export default function App() {
   const [utr, setUtr] = useState('');
 
   const t = TRANSLATIONS[lang];
+  const isStaff = role === 'OWNER' || role === 'DEVELOPER';
+  const [logoFailed, setLogoFailed] = useState(false);
 
   useEffect(() => {
     if (!auth) {
@@ -722,6 +725,8 @@ export default function App() {
     try {
       await signInWithPopup(auth, new GoogleAuthProvider());
     } catch (error) {
+      const code = (error as { code?: string })?.code;
+      if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') return;
       setSyncError(error instanceof Error ? error.message : 'Google sign-in failed.');
     }
   };
@@ -1210,7 +1215,11 @@ export default function App() {
       {/* ROLE SWITCHER & LANGUAGE HEADER */}
       <div style={{ backgroundColor: '#1a050d', color: '#fff', padding: '0.6rem 1.2rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.5rem', fontSize: '0.85rem' }}>
         <div>
-          <span>Role: <strong>{firebaseConfigured ? firebaseLoading ? 'CHECKING ACCESS' : firebaseUser ? role === 'OWNER' ? 'HOST' : role : 'GUEST' : `LOCAL ${role === 'OWNER' ? 'HOST' : role}`}</strong> ({firebaseConfigured ? firebaseUser?.email || 'signed out' : userEmail})</span>
+          {isStaff || !firebaseConfigured ? (
+            <span>Role: <strong>{firebaseConfigured ? firebaseLoading ? 'CHECKING ACCESS' : firebaseUser ? role === 'OWNER' ? 'HOST' : role : 'GUEST' : `LOCAL ${role === 'OWNER' ? 'HOST' : role}`}</strong> ({firebaseConfigured ? firebaseUser?.email || 'signed out' : userEmail})</span>
+          ) : firebaseUser ? (
+            <span>{firebaseUser.email}</span>
+          ) : null}
         </div>
         <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center' }}>
           <select value={lang} onChange={(e) => setLang(e.target.value as Language)} style={{ padding: '0.25rem', borderRadius: '4px' }}>
@@ -1235,16 +1244,26 @@ export default function App() {
         </div>
       </div>
 
-      <div aria-live="polite" style={{ padding: '0.55rem 1.2rem', backgroundColor: firebaseConfigured ? '#e8f5e9' : '#fff3cd', color: firebaseConfigured ? '#1b5e20' : '#664d03', fontSize: '0.85rem' }}>
-        {firebaseConfigured
-          ? 'Firestore is configured; catalog and order changes sync live when connected.'
-          : 'Local demo only: add Firebase project settings to sync catalog and orders across devices.'}
-        {syncError && <span> Sync issue: {syncError}</span>}
-      </div>
+      {(isStaff || !firebaseConfigured) ? (
+        <div aria-live="polite" style={{ padding: '0.55rem 1.2rem', backgroundColor: firebaseConfigured ? '#e8f5e9' : '#fff3cd', color: firebaseConfigured ? '#1b5e20' : '#664d03', fontSize: '0.85rem' }}>
+          {firebaseConfigured
+            ? 'Firestore is configured; catalog and order changes sync live when connected.'
+            : 'Local demo only: add Firebase project settings to sync catalog and orders across devices.'}
+          {syncError && <span> Sync issue: {syncError}</span>}
+        </div>
+      ) : syncError ? (
+        <div aria-live="polite" style={{ padding: '0.55rem 1.2rem', backgroundColor: '#fdecea', color: '#8b1e2d', fontSize: '0.85rem' }}>
+          Something went wrong. Please refresh the page and try again.
+        </div>
+      ) : null}
 
       {/* BOUTIQUE BRANDING */}
       <header style={{ backgroundColor: '#6e1a3a', color: '#fff', padding: '1.5rem', textAlign: 'center' }}>
-        <h1 style={{ margin: 0, fontSize: '2.4rem' }}>{t.appName}</h1>
+        <h1 style={{ margin: 0, fontSize: '2.4rem' }}>
+          {logoFailed ? t.appName : (
+            <img src={LOGO_URL} alt={t.appName} onError={() => setLogoFailed(true)} style={{ height: '80px', maxWidth: '100%', objectFit: 'contain' }} />
+          )}
+        </h1>
         <p style={{ margin: '0.3rem 0 0', fontStyle: 'italic', opacity: 0.9 }}>{t.tagline}</p>
       </header>
 
