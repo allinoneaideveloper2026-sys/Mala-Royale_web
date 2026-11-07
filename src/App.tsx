@@ -1315,7 +1315,7 @@ export default function App() {
         {/* ------------------------------------------------------------------------- */}
         {/* HOST / OWNER VIEW */}
         {/* ------------------------------------------------------------------------- */}
-        {!firebaseLoading && role === 'OWNER' && (
+        {!firebaseLoading && (role === 'OWNER' || role === 'DEVELOPER') && (
           <div style={{ backgroundColor: '#fff', padding: '1.8rem', borderRadius: '10px', boxShadow: '0 2px 10px rgba(0,0,0,0.08)' }}>
             <h2 style={{ color: '#6e1a3a', marginTop: 0 }}>🏪 Host Management Panel</h2>
 
