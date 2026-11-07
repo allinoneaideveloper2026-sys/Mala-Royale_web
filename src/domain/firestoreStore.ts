@@ -16,7 +16,7 @@ import {
 } from 'firebase/firestore';
 import { CONFIG } from '../config';
 import { firestore } from '../firebase';
-import { CourierBill, CustomerAddress, Order, ParcelDetails, PaymentRecord, PincodeCheck, Product, ProductMedia, SavedDeliveryAddress } from './types';
+import { CourierBill, CustomerAddress, Order, ParcelDetails, PaymentRecord, PincodeCheck, Product, ProductMedia, ProductStatus, SavedDeliveryAddress } from './types';
 
 function requireFirestore(): Firestore {
   if (!firestore) throw new Error('Firebase is not configured. Add the VITE_FIREBASE_* settings first.');
@@ -89,6 +89,24 @@ export async function seedInitialProducts(products: Product[]): Promise<void> {
 export async function publishProduct(product: Product): Promise<void> {
   const db = requireFirestore();
   await setDoc(doc(db, 'products', product.id), product);
+}
+
+export async function updateProduct(
+  productId: string,
+  changes: { name: string; price: number; offerPrice?: number; status: ProductStatus },
+): Promise<void> {
+  const db = requireFirestore();
+  await updateDoc(doc(db, 'products', productId), {
+    name: changes.name,
+    price: changes.price,
+    offerPrice: changes.offerPrice === undefined ? deleteField() : changes.offerPrice,
+    status: changes.status,
+  });
+}
+
+export async function deleteProduct(productId: string): Promise<void> {
+  const db = requireFirestore();
+  await deleteDoc(doc(db, 'products', productId));
 }
 
 export async function uploadProductMedia(files: File[]): Promise<ProductMedia[]> {
