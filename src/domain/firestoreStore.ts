@@ -12,11 +12,12 @@ import {
   updateDoc,
   where,
   writeBatch,
+  type DocumentReference,
   type Firestore,
 } from 'firebase/firestore';
 import { CONFIG } from '../config';
 import { firestore } from '../firebase';
-import { CourierBill, CustomerAddress, Order, ParcelDetails, PaymentRecord, PincodeCheck, Product, ProductMedia, ProductStatus, SavedDeliveryAddress } from './types';
+import { CourierBill, CustomerAddress, Enquiry, Order, ParcelDetails, PaymentRecord, PincodeCheck, Product, ProductMedia, ProductStatus, SavedDeliveryAddress } from './types';
 
 function requireFirestore(): Firestore {
   if (!firestore) throw new Error('Firebase is not configured. Add the VITE_FIREBASE_* settings first.');
@@ -88,18 +89,21 @@ export async function seedInitialProducts(products: Product[]): Promise<void> {
 
 export async function publishProduct(product: Product): Promise<void> {
   const db = requireFirestore();
-  await setDoc(doc(db, 'products', product.id), product);
+  // Firestore rejects `undefined` values (for example a blank offer price), so drop them first.
+  const data = JSON.parse(JSON.stringify(product)) as Product;
+  await setDoc(doc(db, 'products', product.id), data);
 }
 
 export async function updateProduct(
   productId: string,
-  changes: { name: string; price: number; offerPrice?: number; status: ProductStatus },
+  changes: { name: string; price: number; offerPrice?: number; quantity: number; status: ProductStatus },
 ): Promise<void> {
   const db = requireFirestore();
   await updateDoc(doc(db, 'products', productId), {
     name: changes.name,
     price: changes.price,
     offerPrice: changes.offerPrice === undefined ? deleteField() : changes.offerPrice,
+    quantity: changes.quantity,
     status: changes.status,
   });
 }
@@ -234,6 +238,12 @@ export async function createCloudOrder(
   return order;
 }
 
+function totalsByProduct(items: Order['items']): Array<[string, number]> {
+  const totals = new Map<string, number>();
+  items.forEach(item => totals.set(item.productId, (totals.get(item.productId) || 0) + item.quantity));
+  return Array.from(totals.entries());
+}
+
 export async function verifyCloudPayment(orderId: string, kind: 'ITEM' | 'COURIER'): Promise<void> {
   const db = requireFirestore();
   const orderRef = doc(db, 'orders', orderId);
@@ -246,11 +256,31 @@ export async function verifyCloudPayment(orderId: string, kind: 'ITEM' | 'COURIE
     }
     const paymentField = kind === 'ITEM' ? 'itemPayment' : 'courierPayment';
     if (!order[paymentField]) return;
+    if (order[paymentField]?.verified) return;
+
+    // Confirming the item payment is the point where stock is reduced.
+    const stockUpdates: Array<{ ref: DocumentReference; quantity: number }> = [];
+    if (kind === 'ITEM') {
+      const entries = totalsByProduct(order.items);
+      const productSnapshots = await Promise.all(entries.map(([productId]) => transaction.get(doc(db, 'products', productId))));
+      productSnapshots.forEach((productSnapshot, index) => {
+        if (!productSnapshot.exists()) return;
+        const product = productSnapshot.data() as Product;
+        if (typeof product.quantity !== 'number') return;
+        const requested = entries[index][1];
+        if (product.quantity < requested) {
+          throw new Error(`Not enough stock for "${product.name}" (${product.quantity} left, ${requested} ordered). Restock it, or mark the order as not accepted.`);
+        }
+        stockUpdates.push({ ref: productSnapshot.ref, quantity: product.quantity - requested });
+      });
+    }
+
     transaction.update(orderRef, {
       [`${paymentField}.verified`]: true,
       stage: kind === 'ITEM' ? 'ITEM_PAYMENT_VERIFIED' : 'COURIER_CHARGE_VERIFIED',
       updatedAt: new Date().toISOString(),
     });
+    stockUpdates.forEach(update => transaction.update(update.ref, { quantity: update.quantity }));
   });
 }
 
@@ -317,7 +347,29 @@ export async function submitCloudOrderForDispatch(orderId: string): Promise<void
 
 export async function markCloudOrderNotAccepted(orderId: string): Promise<void> {
   const db = requireFirestore();
-  await updateDoc(doc(db, 'orders', orderId), { stage: 'NOT_ACCEPTED', updatedAt: new Date().toISOString() });
+  const orderRef = doc(db, 'orders', orderId);
+  await runTransaction(db, async transaction => {
+    const snapshot = await transaction.get(orderRef);
+    if (!snapshot.exists()) throw new Error('Order not found.');
+    const order = snapshot.data() as Order;
+    if (order.stage === 'NOT_ACCEPTED') return;
+
+    // If stock was already reduced when the item payment was confirmed, put it back.
+    const restocks: Array<{ ref: DocumentReference; quantity: number }> = [];
+    if (order.itemPayment?.verified) {
+      const entries = totalsByProduct(order.items);
+      const productSnapshots = await Promise.all(entries.map(([productId]) => transaction.get(doc(db, 'products', productId))));
+      productSnapshots.forEach((productSnapshot, index) => {
+        if (!productSnapshot.exists()) return;
+        const product = productSnapshot.data() as Product;
+        if (typeof product.quantity !== 'number') return;
+        restocks.push({ ref: productSnapshot.ref, quantity: product.quantity + entries[index][1] });
+      });
+    }
+
+    transaction.update(orderRef, { stage: 'NOT_ACCEPTED', updatedAt: new Date().toISOString() });
+    restocks.forEach(update => transaction.update(update.ref, { quantity: update.quantity }));
+  });
 }
 
 export async function markCloudOrderDelivered(orderId: string): Promise<void> {
@@ -441,4 +493,51 @@ export function isConfiguredDeveloper(email: string): boolean {
 
 export function isConfiguredOwner(email: string): boolean {
   return CONFIG.ownerEmails.some((owner: string) => owner.trim().toLowerCase() === email.toLowerCase());
+}
+
+export interface EnquiryInput {
+  name: string;
+  phone: string;
+  message: string;
+  productId?: string;
+  productName?: string;
+}
+
+export async function submitEnquiry(userId: string, input: EnquiryInput): Promise<void> {
+  const db = requireFirestore();
+  const name = input.name.trim();
+  const phone = input.phone.replace(/\D/g, '');
+  const message = input.message.trim();
+  if (!name || name.length > 80) throw new Error('Enter your name (up to 80 characters).');
+  if (!/^\d{10,15}$/.test(phone)) throw new Error('Enter a valid WhatsApp number.');
+  if (!message || message.length > 1000) throw new Error('Enter your message (up to 1000 characters).');
+
+  const data: Omit<Enquiry, 'id'> = {
+    userId,
+    name,
+    phone,
+    message,
+    status: 'NEW',
+    createdAt: new Date().toISOString(),
+    ...(input.productId ? { productId: input.productId } : {}),
+    ...(input.productName ? { productName: input.productName.slice(0, 120) } : {}),
+  };
+  await setDoc(doc(db, 'enquiries', `ENQ-${createId()}`), data);
+}
+
+export function subscribeEnquiries(onChange: (enquiries: Enquiry[]) => void, onError: (error: Error) => void) {
+  const db = requireFirestore();
+  return onSnapshot(collection(db, 'enquiries'), snapshot => {
+    onChange(snapshot.docs.map(enquiry => ({ ...enquiry.data(), id: enquiry.id } as Enquiry)));
+  }, onError);
+}
+
+export async function setEnquiryStatus(enquiryId: string, status: 'NEW' | 'REPLIED'): Promise<void> {
+  const db = requireFirestore();
+  await updateDoc(doc(db, 'enquiries', enquiryId), { status });
+}
+
+export async function deleteEnquiry(enquiryId: string): Promise<void> {
+  const db = requireFirestore();
+  await deleteDoc(doc(db, 'enquiries', enquiryId));
 }
