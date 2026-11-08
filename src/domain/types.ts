@@ -28,6 +28,7 @@ export interface Product {
   description: string;
   image: string;
   media?: ProductMedia[];
+  quantity?: number;
   status?: ProductStatus;
 }
 
@@ -115,4 +116,16 @@ export interface Order {
   courierPayment?: PaymentRecord;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface Enquiry {
+  id: string;
+  userId: string;
+  name: string;
+  phone: string;
+  message: string;
+  productId?: string;
+  productName?: string;
+  status: 'NEW' | 'REPLIED';
+  createdAt: string;
 }
