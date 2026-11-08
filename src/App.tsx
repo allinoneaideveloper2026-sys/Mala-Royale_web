@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { GoogleAuthProvider, linkWithPopup, onAuthStateChanged, signInAnonymously, signInWithCredential, signInWithPopup, signOut, type User } from 'firebase/auth';
 import { CONFIG } from './config';
 import { TRANSLATIONS, Language } from './i18n';
-import { UserRole, Product, ProductMedia, ProductStatus, Order, CourierBill, CustomerAddress, ParcelDetails, ParcelParty, PincodeCheck, SavedDeliveryAddress } from './domain/types';
+import { UserRole, Product, ProductMedia, ProductStatus, Enquiry, Order, CourierBill, CustomerAddress, ParcelDetails, ParcelParty, PincodeCheck, SavedDeliveryAddress } from './domain/types';
 import { globalOrderBook } from './domain/OrderBook';
 import { auth, firebaseConfigured } from './firebase';
 import {
@@ -12,6 +12,7 @@ import {
   createCloudOrder,
   confirmCloudOrderDelivery,
   deleteCloudDeliveryAddress,
+  deleteEnquiry,
   deleteProduct,
   isAuthorizedHost,
   isConfiguredDeveloper,
@@ -22,13 +23,16 @@ import {
   revokeHost,
   saveCloudDeliveryAddress,
   saveCloudParcelDetails,
+  setEnquiryStatus,
   subscribeAuthorizedHosts,
   subscribeCheckoutQr,
+  subscribeEnquiries,
   subscribeSavedAddresses,
   subscribeOrders,
   subscribeProducts,
   submitCloudOrderForDispatch,
   submitCloudCourierPayment,
+  submitEnquiry,
   updateProduct,
   uploadCheckoutQr,
   uploadProductMedia,
@@ -75,7 +79,27 @@ type CartLine = { product: Product; quantity: number };
 const MAX_CART_QUANTITY = 10;
 const unitPrice = (product: Product) => product.offerPrice || product.price;
 
-const isPurchasable = (product: Product) => !product.status || product.status === 'AVAILABLE';
+// Stock-aware availability: zero quantity automatically shows "Out of stock" to customers.
+const effectiveStatus = (product: Product): ProductStatus => {
+  if (product.status === 'COMING_SOON') return 'COMING_SOON';
+  if (product.status === 'OUT_OF_STOCK') return 'OUT_OF_STOCK';
+  if (typeof product.quantity === 'number' && product.quantity <= 0) return 'OUT_OF_STOCK';
+  return 'AVAILABLE';
+};
+const isPurchasable = (product: Product) => effectiveStatus(product) === 'AVAILABLE';
+const maxOrderable = (product: Product) => (
+  typeof product.quantity === 'number' ? Math.max(0, Math.min(product.quantity, MAX_CART_QUANTITY)) : MAX_CART_QUANTITY
+);
+
+const linkButtonStyle: React.CSSProperties = {
+  background: 'none',
+  border: 'none',
+  color: '#128c7e',
+  cursor: 'pointer',
+  fontWeight: 'bold',
+  padding: 0,
+  fontSize: '0.8rem',
+};
 
 const STATUS_LABELS: Record<ProductStatus, string> = {
   AVAILABLE: 'Available',
@@ -104,6 +128,14 @@ function whatsAppLink(phone: string, message: string): string {
   const digits = phone.replace(/\D/g, '');
   const withCountry = digits.length === 10 ? `91${digits}` : digits;
   return `https://wa.me/${withCountry}?text=${encodeURIComponent(message)}`;
+}
+
+function WhatsAppIcon() {
+  return (
+    <svg width="30" height="30" viewBox="0 0 24 24" fill="#fff" aria-hidden="true" focusable="false">
+      <path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413Z" />
+    </svg>
+  );
 }
 
 function GoogleIcon() {
@@ -152,22 +184,24 @@ function ProductManagerRow({
   onDelete,
 }: {
   product: Product;
-  onSave: (productId: string, changes: { name: string; price: number; offerPrice?: number; status: ProductStatus }) => Promise<void>;
+  onSave: (productId: string, changes: { name: string; price: number; offerPrice?: number; quantity: number; status: ProductStatus }) => Promise<void>;
   onDelete: (product: Product) => Promise<void>;
 }) {
   const [editing, setEditing] = useState(false);
   const [name, setName] = useState(product.name);
   const [price, setPrice] = useState(String(product.price));
   const [offerPrice, setOfferPrice] = useState(product.offerPrice ? String(product.offerPrice) : '');
+  const [quantity, setQuantity] = useState(typeof product.quantity === 'number' ? String(product.quantity) : '');
   const [status, setStatus] = useState<ProductStatus>(product.status || 'AVAILABLE');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  const currentStatus: ProductStatus = product.status || 'AVAILABLE';
+  const shownStatus = effectiveStatus(product);
 
   const openEditor = () => {
     setName(product.name);
     setPrice(String(product.price));
     setOfferPrice(product.offerPrice ? String(product.offerPrice) : '');
+    setQuantity(typeof product.quantity === 'number' ? String(product.quantity) : '');
     setStatus(product.status || 'AVAILABLE');
     setError('');
     setEditing(true);
@@ -177,6 +211,7 @@ function ProductManagerRow({
     event.preventDefault();
     const nextPrice = Number(price);
     const nextOffer = offerPrice.trim() === '' ? undefined : Number(offerPrice);
+    const nextQuantity = Math.floor(Number(quantity));
     if (!name.trim()) {
       setError('Enter a product name.');
       return;
@@ -186,13 +221,17 @@ function ProductManagerRow({
       return;
     }
     if (nextOffer !== undefined && (!Number.isFinite(nextOffer) || nextOffer <= 0 || nextOffer >= nextPrice)) {
-      setError('The offer price must be lower than the regular price.');
+      setError('The offer price must be lower than the regular price. Leave it blank for no offer.');
+      return;
+    }
+    if (quantity.trim() === '' || !Number.isFinite(nextQuantity) || nextQuantity < 0) {
+      setError('Enter the quantity in stock (0 or more).');
       return;
     }
     setBusy(true);
     setError('');
     try {
-      await onSave(product.id, { name: name.trim(), price: nextPrice, offerPrice: nextOffer, status });
+      await onSave(product.id, { name: name.trim(), price: nextPrice, offerPrice: nextOffer, quantity: nextQuantity, status });
       setEditing(false);
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : 'Could not save the changes.');
@@ -220,11 +259,14 @@ function ProductManagerRow({
         <div style={{ flex: '1 1 160px', minWidth: 0 }}>
           <strong>{product.name}</strong>
           <div style={{ fontSize: '0.85rem', color: '#666' }}>
-            {product.category} · ₹{unitPrice(product)}
-            {product.offerPrice ? <span style={{ textDecoration: 'line-through', marginLeft: '0.4rem', color: '#999' }}>₹{product.price}</span> : null}
+            {product.category} · ₹{product.price}
+            {product.offerPrice ? <span> · Offer ₹{product.offerPrice}</span> : <span> · No offer</span>}
+          </div>
+          <div style={{ fontSize: '0.85rem', color: '#666' }}>
+            {typeof product.quantity === 'number' ? `Quantity in stock: ${product.quantity}` : 'Quantity not set'}
           </div>
         </div>
-        <span style={{ ...STATUS_COLORS[currentStatus], fontSize: '0.75rem', fontWeight: 'bold', padding: '0.2rem 0.6rem', borderRadius: '999px' }}>{STATUS_LABELS[currentStatus]}</span>
+        <span style={{ ...STATUS_COLORS[shownStatus], fontSize: '0.75rem', fontWeight: 'bold', padding: '0.2rem 0.6rem', borderRadius: '999px' }}>{STATUS_LABELS[shownStatus]}</span>
         <div style={{ display: 'flex', gap: '0.4rem' }}>
           <button type="button" disabled={busy} onClick={editing ? () => setEditing(false) : openEditor} style={{ padding: '0.4rem 0.8rem', cursor: 'pointer' }}>{editing ? 'Cancel' : 'Edit'}</button>
           <button type="button" disabled={busy} onClick={() => void remove()} style={{ padding: '0.4rem 0.8rem', backgroundColor: '#fff', color: '#8b1e2d', border: '1px solid #8b1e2d', borderRadius: '4px', cursor: 'pointer' }}>Remove</button>
@@ -234,11 +276,12 @@ function ProductManagerRow({
         <form onSubmit={save} style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: '0.6rem', marginTop: '0.7rem' }}>
           <input aria-label="Product name" placeholder="Product name" value={name} onChange={event => setName(event.target.value)} required style={{ padding: '0.5rem' }} />
           <input aria-label="Regular price" type="number" min="1" step="0.01" placeholder="Regular price (₹)" value={price} onChange={event => setPrice(event.target.value)} required style={{ padding: '0.5rem' }} />
-          <input aria-label="Offer price (optional)" type="number" min="1" step="0.01" placeholder="Offer price (₹, optional)" value={offerPrice} onChange={event => setOfferPrice(event.target.value)} style={{ padding: '0.5rem' }} />
+          <input aria-label="Offer price (leave blank for no offer)" type="number" min="1" step="0.01" placeholder="Offer price (blank = no offer)" value={offerPrice} onChange={event => setOfferPrice(event.target.value)} style={{ padding: '0.5rem' }} />
+          <input aria-label="Quantity in stock" type="number" min="0" step="1" placeholder="Quantity in stock" value={quantity} onChange={event => setQuantity(event.target.value)} required style={{ padding: '0.5rem' }} />
           <select aria-label="Availability" value={status} onChange={event => setStatus(event.target.value as ProductStatus)} style={{ padding: '0.5rem' }}>
-            <option value="AVAILABLE">Available</option>
-            <option value="OUT_OF_STOCK">Out of stock</option>
+            <option value="AVAILABLE">Available (auto "Out of stock" at 0)</option>
             <option value="COMING_SOON">Coming soon</option>
+            <option value="OUT_OF_STOCK">Out of stock (pause sales)</option>
           </select>
           <button type="submit" disabled={busy} style={{ backgroundColor: '#6e1a3a', color: '#fff', border: 0, borderRadius: '4px', padding: '0.5rem 0.8rem', cursor: 'pointer', fontWeight: 'bold' }}>{busy ? 'Saving...' : 'Save changes'}</button>
         </form>
@@ -640,22 +683,102 @@ async function validateProductMedia(files: File[]): Promise<void> {
   }
 }
 
+function MediaLightbox({
+  items,
+  startIndex,
+  name,
+  onClose,
+}: {
+  items: ProductMedia[];
+  startIndex: number;
+  name: string;
+  onClose: () => void;
+}) {
+  const [index, setIndex] = useState(startIndex);
+  const current = items[Math.min(index, items.length - 1)];
+  const go = (delta: number) => setIndex(value => (value + delta + items.length) % items.length);
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose();
+      if (event.key === 'ArrowLeft') go(-1);
+      if (event.key === 'ArrowRight') go(1);
+    };
+    window.addEventListener('keydown', onKey);
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      document.body.style.overflow = previousOverflow;
+    };
+  }, []);
+
+  const arrowStyle: React.CSSProperties = {
+    background: 'rgba(255,255,255,0.15)',
+    border: 'none',
+    color: '#fff',
+    fontSize: '2.2rem',
+    width: '48px',
+    height: '64px',
+    borderRadius: '8px',
+    cursor: 'pointer',
+    flex: '0 0 48px',
+  };
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label={`${name} photos and video`}
+      onClick={onClose}
+      style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.92)', zIndex: 1300, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem', padding: '1rem' }}
+    >
+      <button type="button" aria-label="Close" onClick={onClose} style={{ position: 'absolute', top: '10px', right: '16px', background: 'none', border: 'none', color: '#fff', fontSize: '2rem', cursor: 'pointer' }}>✕</button>
+      {items.length > 1 && (
+        <button type="button" aria-label="Previous" onClick={event => { event.stopPropagation(); go(-1); }} style={arrowStyle}>‹</button>
+      )}
+      <div onClick={event => event.stopPropagation()} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '0.6rem', minWidth: 0 }}>
+        {current.type === 'video' ? (
+          <video src={current.url} controls autoPlay playsInline style={{ maxWidth: '85vw', maxHeight: '82vh' }} />
+        ) : (
+          <img src={current.url} alt={name} style={{ maxWidth: '85vw', maxHeight: '82vh', objectFit: 'contain' }} />
+        )}
+        <span style={{ color: '#fff', fontSize: '0.85rem' }}>{name}{items.length > 1 ? ` · ${index + 1} / ${items.length}` : ''}</span>
+      </div>
+      {items.length > 1 && (
+        <button type="button" aria-label="Next" onClick={event => { event.stopPropagation(); go(1); }} style={arrowStyle}>›</button>
+      )}
+    </div>
+  );
+}
+
 function ProductGallery({ product }: { product: Product }) {
   const media: ProductMedia[] = product.media?.length
     ? product.media
     : [{ url: product.image, type: 'image' }];
   const [selectedIndex, setSelectedIndex] = useState(0);
+  const [viewerOpen, setViewerOpen] = useState(false);
   const selectedMedia = media[Math.min(selectedIndex, media.length - 1)];
 
   useEffect(() => setSelectedIndex(0), [product.id]);
 
   return (
     <div>
-      {selectedMedia.type === 'video' ? (
-        <video src={selectedMedia.url} controls playsInline preload="metadata" style={{ width: '100%', height: '200px', objectFit: 'cover', display: 'block' }} />
-      ) : (
-        <img src={selectedMedia.url} alt={product.name} style={{ width: '100%', height: '200px', objectFit: 'cover', display: 'block' }} />
-      )}
+      <div className="mr-zoomable" style={{ position: 'relative', cursor: 'zoom-in' }} onClick={() => setViewerOpen(true)}>
+        {selectedMedia.type === 'video' ? (
+          <video src={selectedMedia.url} controls playsInline preload="metadata" onClick={event => event.stopPropagation()} style={{ width: '100%', height: '200px', objectFit: 'cover', display: 'block' }} />
+        ) : (
+          <img src={selectedMedia.url} alt={product.name} style={{ width: '100%', height: '200px', objectFit: 'cover', display: 'block' }} />
+        )}
+        <button
+          type="button"
+          aria-label={`View ${product.name} full size`}
+          onClick={event => { event.stopPropagation(); setViewerOpen(true); }}
+          style={{ position: 'absolute', top: '8px', right: '8px', backgroundColor: 'rgba(0,0,0,0.6)', color: '#fff', border: 'none', borderRadius: '999px', padding: '0.3rem 0.7rem', fontSize: '0.75rem', cursor: 'pointer' }}
+        >
+          ⤢ View full
+        </button>
+      </div>
       {media.length > 1 && (
         <div style={{ display: 'flex', gap: '0.4rem', overflowX: 'auto', padding: '0.5rem' }}>
           {media.map((item, index) => (
@@ -676,6 +799,7 @@ function ProductGallery({ product }: { product: Product }) {
           ))}
         </div>
       )}
+      {viewerOpen && <MediaLightbox items={media} startIndex={selectedIndex} name={product.name} onClose={() => setViewerOpen(false)} />}
     </div>
   );
 }
@@ -697,7 +821,7 @@ export default function App() {
   // Catalog State
   const [products, setProducts] = useState<Product[]>(firebaseConfigured ? [] : INITIAL_CATALOG);
   const [categoryFilter, setCategoryFilter] = useState<string>('All');
-  const [newProduct, setNewProduct] = useState({ name: '', category: 'Sarees', price: '', offerPrice: '', description: '', image: '' });
+  const [newProduct, setNewProduct] = useState({ name: '', category: 'Sarees', price: '', offerPrice: '', quantity: '1', description: '', image: '' });
   const [productMediaFiles, setProductMediaFiles] = useState<File[]>([]);
   const [paymentQrUrl, setPaymentQrUrl] = useState('');
   const [paymentQrFile, setPaymentQrFile] = useState<File | null>(null);
@@ -707,9 +831,19 @@ export default function App() {
   const [isCartOpen, setIsCartOpen] = useState(false);
   const [placedOrder, setPlacedOrder] = useState<{ orderId: string; total: number; phone: string; name: string } | null>(null);
   const [orderCopied, setOrderCopied] = useState(false);
+  const [enquiries, setEnquiries] = useState<Enquiry[]>([]);
+  const [isEnquiryOpen, setIsEnquiryOpen] = useState(false);
+  const [enquiryName, setEnquiryName] = useState('');
+  const [enquiryPhone, setEnquiryPhone] = useState('');
+  const [enquiryMessage, setEnquiryMessage] = useState('');
+  const [enquiryProduct, setEnquiryProduct] = useState<{ id: string; name: string } | null>(null);
+  const [enquirySending, setEnquirySending] = useState(false);
+  const [enquirySent, setEnquirySent] = useState(false);
+  const [enquiryError, setEnquiryError] = useState('');
+  const [lastEnquiryAt, setLastEnquiryAt] = useState(0);
   // Always price the cart from the live catalog so host price changes apply immediately.
   const cart: CartLine[] = cartLines.map(line => ({ ...line, product: products.find(product => product.id === line.product.id) || line.product }));
-  const unavailableLines = cart.filter(line => !products.some(product => product.id === line.product.id) || !isPurchasable(line.product));
+  const unavailableLines = cart.filter(line => !products.some(product => product.id === line.product.id) || !isPurchasable(line.product) || line.quantity > maxOrderable(line.product));
   const [checkoutStep, setCheckoutStep] = useState<1 | 2 | 3>(1);
   const [courierPolicyAccepted, setCourierPolicyAccepted] = useState(false);
   const [isCheckoutOpen, setIsCheckoutOpen] = useState(false);
@@ -828,6 +962,11 @@ export default function App() {
       setAuthorizedHosts(hosts);
     }, error => setSyncError(error.message));
   }, [role]);
+
+  useEffect(() => {
+    if (!firebaseConfigured || !isStaff) return;
+    return subscribeEnquiries(setEnquiries, error => setSyncError(error.message));
+  }, [isStaff]);
 
   useEffect(() => {
     if (!firebaseConfigured) return;
@@ -986,6 +1125,17 @@ export default function App() {
   const handlePublishProduct = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newProduct.name || !newProduct.price || isUploadingProduct) return;
+    const quantityValue = Math.floor(Number(newProduct.quantity));
+    if (newProduct.quantity.trim() === '' || !Number.isFinite(quantityValue) || quantityValue < 0) {
+      alert('Enter the quantity in stock (0 or more).');
+      return;
+    }
+    const regularValue = parseFloat(newProduct.price);
+    const offerValue = newProduct.offerPrice.trim() === '' ? undefined : parseFloat(newProduct.offerPrice);
+    if (offerValue !== undefined && (!Number.isFinite(offerValue) || offerValue <= 0 || offerValue >= regularValue)) {
+      alert('The offer price must be lower than the regular price. Leave it blank for no offer.');
+      return;
+    }
     if (!confirmHostAction(`Publish "${newProduct.name}" to the catalog?`)) return;
     setIsUploadingProduct(true);
     try {
@@ -1002,8 +1152,9 @@ export default function App() {
         id: productId,
         name: newProduct.name,
         category: newProduct.category,
-        price: parseFloat(newProduct.price),
-        offerPrice: newProduct.offerPrice ? parseFloat(newProduct.offerPrice) : undefined,
+        price: regularValue,
+        ...(offerValue !== undefined ? { offerPrice: offerValue } : {}),
+        quantity: quantityValue,
         description: newProduct.description || 'Exclusive boutique craftsmanship.',
         image: coverImage,
         media,
@@ -1013,7 +1164,7 @@ export default function App() {
       } else {
         setProducts([addedProduct, ...products]);
       }
-      setNewProduct({ name: '', category: 'Sarees', price: '', offerPrice: '', description: '', image: '' });
+      setNewProduct({ name: '', category: 'Sarees', price: '', offerPrice: '', quantity: '1', description: '', image: '' });
       setProductMediaFiles([]);
       alert(firebaseConfigured ? 'Item published to the live catalog.' : 'Item added to the local demo catalog.');
     } catch (error) {
@@ -1061,7 +1212,7 @@ export default function App() {
   // Host Action: Edit or remove a published product
   const handleUpdateProduct = async (
     productId: string,
-    changes: { name: string; price: number; offerPrice?: number; status: ProductStatus },
+    changes: { name: string; price: number; offerPrice?: number; quantity: number; status: ProductStatus },
   ) => {
     try {
       if (firebaseConfigured) {
@@ -1089,17 +1240,100 @@ export default function App() {
     }
   };
 
+  // Customer enquiries. The host's WhatsApp number is never shown to customers:
+  // they leave a message and their own number, and the host replies from the panel.
+  const openEnquiry = (product?: Product) => {
+    setEnquiryProduct(product ? { id: product.id, name: product.name } : null);
+    setEnquiryMessage(product ? `I'm interested in "${product.name}" (₹${unitPrice(product)}). Is it available?` : '');
+    setEnquiryError('');
+    setEnquirySent(false);
+    setIsEnquiryOpen(true);
+  };
+
+  const sendEnquiry = async () => {
+    if (enquirySending) return;
+    const name = enquiryName.trim();
+    const phone = enquiryPhone.replace(/\D/g, '');
+    const message = enquiryMessage.trim();
+    if (!name) {
+      setEnquiryError('Please enter your name.');
+      return;
+    }
+    if (phone.length < 10 || phone.length > 15) {
+      setEnquiryError('Enter your 10-digit WhatsApp number so we can reply.');
+      return;
+    }
+    if (!message) {
+      setEnquiryError('Please type your question.');
+      return;
+    }
+    if (Date.now() - lastEnquiryAt < 20000) {
+      setEnquiryError('Please wait a few seconds before sending another enquiry.');
+      return;
+    }
+    setEnquirySending(true);
+    setEnquiryError('');
+    try {
+      const enquiryInput = { name, phone, message, productId: enquiryProduct?.id, productName: enquiryProduct?.name };
+      if (firebaseConfigured) {
+        const uid = firebaseUser?.uid || await ensureCustomerSession();
+        await withTimeout(submitEnquiry(uid, enquiryInput), 30000, 'Sending is taking too long. Check your internet connection and try again.');
+      } else {
+        setEnquiries(current => [{ ...enquiryInput, id: `ENQ-${Date.now()}`, userId: 'local', status: 'NEW', createdAt: new Date().toISOString() }, ...current]);
+      }
+      setLastEnquiryAt(Date.now());
+      setEnquirySent(true);
+      setEnquiryMessage('');
+    } catch (error) {
+      console.error('Enquiry failed:', error);
+      setEnquiryError('We could not send your enquiry right now. Please try again in a moment.');
+    } finally {
+      setEnquirySending(false);
+    }
+  };
+
+  const handleEnquiryStatus = async (enquiry: Enquiry, status: 'NEW' | 'REPLIED') => {
+    try {
+      if (firebaseConfigured) {
+        await withTimeout(setEnquiryStatus(enquiry.id, status), 30000, 'Updating the enquiry is taking too long. Check your internet connection and try again.');
+      } else {
+        setEnquiries(current => current.map(item => item.id === enquiry.id ? { ...item, status } : item));
+      }
+    } catch (error) {
+      setSyncError(error instanceof Error ? error.message : 'Could not update the enquiry.');
+    }
+  };
+
+  const handleDeleteEnquiry = async (enquiry: Enquiry) => {
+    if (!confirmHostAction(`Delete the enquiry from ${enquiry.name}?`)) return;
+    try {
+      if (firebaseConfigured) {
+        await withTimeout(deleteEnquiry(enquiry.id), 30000, 'Deleting the enquiry is taking too long. Check your internet connection and try again.');
+      } else {
+        setEnquiries(current => current.filter(item => item.id !== enquiry.id));
+      }
+    } catch (error) {
+      setSyncError(error instanceof Error ? error.message : 'Could not delete the enquiry.');
+    }
+  };
+
+  const shareProduct = (product: Product) => {
+    const link = `${window.location.origin}${window.location.pathname}`;
+    const text = `Look at this at Mala Royale: ${product.name} (₹${unitPrice(product)}) ${link}`;
+    window.open(`https://wa.me/?text=${encodeURIComponent(text)}`, '_blank', 'noopener,noreferrer');
+  };
+
   // Cart Management
   const addToCart = (product: Product) => isPurchasable(product) && setCart(current => (
     current.some(line => line.product.id === product.id)
       ? current.map(line => line.product.id === product.id
-        ? { ...line, quantity: Math.min(line.quantity + 1, MAX_CART_QUANTITY) }
+        ? { ...line, quantity: Math.min(line.quantity + 1, maxOrderable(products.find(item => item.id === product.id) || product)) }
         : line)
       : [...current, { product, quantity: 1 }]
   ));
   const changeQuantity = (productId: string, delta: number) => setCart(current => current.flatMap(line => {
     if (line.product.id !== productId) return [line];
-    const nextQuantity = Math.min(line.quantity + delta, MAX_CART_QUANTITY);
+    const nextQuantity = Math.min(line.quantity + delta, maxOrderable(products.find(item => item.id === productId) || line.product));
     return nextQuantity <= 0 ? [] : [{ ...line, quantity: nextQuantity }];
   }));
   const removeFromCart = (productId: string) => setCart(current => current.filter(line => line.product.id !== productId));
@@ -1440,6 +1674,12 @@ export default function App() {
   return (
     <div style={{ fontFamily: 'Georgia, serif', backgroundColor: '#fdf8f6', color: '#333', minHeight: '100vh' }}>
       
+      <style>{`
+        .mr-zoomable { overflow: hidden; }
+        .mr-zoomable img { transition: transform 0.35s ease; }
+        .mr-zoomable:hover img { transform: scale(1.06); }
+      `}</style>
+
       {/* ROLE SWITCHER & LANGUAGE HEADER */}
       <div style={{ backgroundColor: '#1a050d', color: '#fff', padding: '0.6rem 1.2rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.5rem', fontSize: '0.85rem' }}>
         <div>
@@ -1556,7 +1796,8 @@ export default function App() {
                   <option value="Custom Kuchu">Custom Kuchu</option>
                 </select>
                 <input type="number" placeholder="Regular Price (₹) *" value={newProduct.price} onChange={e => setNewProduct({ ...newProduct, price: e.target.value })} required style={{ padding: '0.6rem' }} />
-                <input type="number" placeholder="Offer Price (₹, Optional)" value={newProduct.offerPrice} onChange={e => setNewProduct({ ...newProduct, offerPrice: e.target.value })} style={{ padding: '0.6rem' }} />
+                <input type="number" min="1" step="0.01" aria-label="Offer price (leave blank for no offer)" placeholder="Offer Price (₹) - blank = no offer" value={newProduct.offerPrice} onChange={e => setNewProduct({ ...newProduct, offerPrice: e.target.value })} style={{ padding: '0.6rem' }} />
+                <input type="number" min="0" step="1" aria-label="Quantity in stock" placeholder="Quantity in stock *" value={newProduct.quantity} onChange={e => setNewProduct({ ...newProduct, quantity: e.target.value })} required style={{ padding: '0.6rem' }} />
                 <div style={{ gridColumn: '1 / -1', display: 'grid', gap: '0.25rem' }}>
                   <input type="text" placeholder="Optional: direct image link (ends in .jpg, .png or .webp)" value={newProduct.image} onChange={e => setNewProduct({ ...newProduct, image: e.target.value })} style={{ padding: '0.6rem' }} />
                   <small style={{ color: '#666' }}>Only used when no photo is uploaded. Google Drive, Google Photos and Instagram page links do not work as image links, so upload the photo instead.</small>
@@ -1610,6 +1851,37 @@ export default function App() {
                   {isUploadingQr ? 'Uploading...' : 'Save checkout QR'}
                 </button>
               </div>
+            </div>
+
+            {/* Customer enquiries */}
+            <div style={{ backgroundColor: '#fff', padding: '1.2rem', border: '1px solid #ddd', borderRadius: '8px', marginBottom: '2rem' }}>
+              <h3 style={{ margin: '0 0 0.3rem' }}>Customer enquiries ({enquiries.filter(item => item.status === 'NEW').length} new)</h3>
+              <p style={{ margin: '0 0 0.8rem', color: '#666', fontSize: '0.85rem' }}>
+                Customers write to you from the chat button on the website. Your own WhatsApp number is never shown to them. Reply on WhatsApp using the customer's number.
+              </p>
+              {enquiries.length === 0 ? (
+                <p style={{ margin: 0, color: '#666', fontStyle: 'italic' }}>No enquiries yet.</p>
+              ) : (
+                <div style={{ display: 'grid', gap: '0.8rem' }}>
+                  {[...enquiries].sort((left, right) => right.createdAt.localeCompare(left.createdAt)).map(enquiry => (
+                    <div key={enquiry.id} style={{ border: '1px solid #eee', borderLeft: `4px solid ${enquiry.status === 'NEW' ? '#25d366' : '#bbb'}`, borderRadius: '6px', padding: '0.7rem' }}>
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', alignItems: 'center' }}>
+                        <strong>{enquiry.name}</strong>
+                        <span>· {enquiry.phone}</span>
+                        <span style={{ fontSize: '0.75rem', fontWeight: 'bold', padding: '0.15rem 0.55rem', borderRadius: '999px', backgroundColor: enquiry.status === 'NEW' ? '#e8f5e9' : '#eee', color: enquiry.status === 'NEW' ? '#1b5e20' : '#555' }}>{enquiry.status === 'NEW' ? 'New' : 'Replied'}</span>
+                      </div>
+                      <div style={{ fontSize: '0.8rem', color: '#777', margin: '0.2rem 0' }}>{new Date(enquiry.createdAt).toLocaleString()}</div>
+                      {enquiry.productName && <div style={{ fontSize: '0.85rem', color: '#555' }}>About: {enquiry.productName}</div>}
+                      <p style={{ margin: '0.4rem 0', whiteSpace: 'pre-wrap' }}>{enquiry.message}</p>
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', alignItems: 'center' }}>
+                        <a href={whatsAppLink(enquiry.phone, `Hello ${enquiry.name}, thank you for contacting Mala Royale${enquiry.productName ? ` about ${enquiry.productName}` : ''}. `)} target="_blank" rel="noreferrer" style={{ backgroundColor: '#25d366', color: '#fff', textDecoration: 'none', fontWeight: 'bold', padding: '0.4rem 0.8rem', borderRadius: '4px' }}>Reply on WhatsApp</a>
+                        <button type="button" onClick={() => void handleEnquiryStatus(enquiry, enquiry.status === 'NEW' ? 'REPLIED' : 'NEW')} style={{ padding: '0.4rem 0.8rem', cursor: 'pointer' }}>{enquiry.status === 'NEW' ? 'Mark replied' : 'Mark as new'}</button>
+                        <button type="button" onClick={() => void handleDeleteEnquiry(enquiry)} style={{ padding: '0.4rem 0.8rem', backgroundColor: '#fff', color: '#8b1e2d', border: '1px solid #8b1e2d', borderRadius: '4px', cursor: 'pointer' }}>Delete</button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
 
             {/* Manage catalog */}
@@ -1829,6 +2101,13 @@ export default function App() {
                       <span style={{ fontSize: '0.75rem', color: '#6e1a3a', fontWeight: 'bold', textTransform: 'uppercase' }}>{product.category}</span>
                       <h3 style={{ margin: '0.3rem 0', fontSize: '1.1rem' }}>{product.name}</h3>
                       <p style={{ fontSize: '0.85rem', color: '#666', lineHeight: '1.3' }}>{product.description}</p>
+                      {typeof product.quantity === 'number' && product.quantity > 0 && product.quantity <= 3 && effectiveStatus(product) === 'AVAILABLE' && (
+                        <p style={{ margin: '0.2rem 0', color: '#b45309', fontSize: '0.8rem', fontWeight: 'bold' }}>Only {product.quantity} left</p>
+                      )}
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.9rem', marginTop: '0.3rem' }}>
+                        <button type="button" onClick={() => openEnquiry(product)} style={linkButtonStyle}>💬 Ask about this</button>
+                        <button type="button" onClick={() => shareProduct(product)} style={linkButtonStyle}>↗ Share</button>
+                      </div>
                     </div>
                     <div style={{ marginTop: '1rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
                       <div>
@@ -1857,8 +2136,8 @@ export default function App() {
                           </button>
                         </div>
                       ) : (
-                        <span style={{ ...STATUS_COLORS[product.status || 'OUT_OF_STOCK'], fontSize: '0.85rem', fontWeight: 'bold', padding: '0.4rem 0.8rem', borderRadius: '999px' }}>
-                          {STATUS_LABELS[product.status || 'OUT_OF_STOCK']}
+                        <span style={{ ...STATUS_COLORS[effectiveStatus(product)], fontSize: '0.85rem', fontWeight: 'bold', padding: '0.4rem 0.8rem', borderRadius: '999px' }}>
+                          {STATUS_LABELS[effectiveStatus(product)]}
                         </span>
                       )}
                     </div>
@@ -1887,11 +2166,11 @@ export default function App() {
                             <img src={line.product.image} alt="" style={{ width: '64px', height: '64px', objectFit: 'cover', borderRadius: '6px', flex: '0 0 64px' }} />
                             <div style={{ flex: 1, minWidth: 0 }}>
                               <strong>{line.product.name}</strong>
-                              <div style={{ fontSize: '0.85rem', color: '#666' }}>₹{unitPrice(line.product)} each</div>
+                              <div style={{ fontSize: '0.85rem', color: '#666' }}>₹{unitPrice(line.product)} each{typeof line.product.quantity === 'number' && line.product.quantity <= 5 ? ` · only ${line.product.quantity} left` : ''}</div>
                               <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.4rem', marginTop: '0.4rem' }}>
                                 <button type="button" aria-label={`Decrease quantity of ${line.product.name}`} onClick={() => changeQuantity(line.product.id, -1)} style={{ width: '30px', height: '30px', cursor: 'pointer' }}>−</button>
                                 <span aria-live="polite" style={{ minWidth: '1.5rem', textAlign: 'center', fontWeight: 'bold' }}>{line.quantity}</span>
-                                <button type="button" aria-label={`Increase quantity of ${line.product.name}`} disabled={line.quantity >= MAX_CART_QUANTITY} onClick={() => changeQuantity(line.product.id, 1)} style={{ width: '30px', height: '30px', cursor: line.quantity >= MAX_CART_QUANTITY ? 'not-allowed' : 'pointer' }}>+</button>
+                                <button type="button" aria-label={`Increase quantity of ${line.product.name}`} disabled={line.quantity >= maxOrderable(line.product)} onClick={() => changeQuantity(line.product.id, 1)} style={{ width: '30px', height: '30px', cursor: line.quantity >= maxOrderable(line.product) ? 'not-allowed' : 'pointer' }}>+</button>
                                 <button type="button" onClick={() => removeFromCart(line.product.id)} style={{ marginLeft: '0.4rem', background: 'none', border: 'none', color: '#8b1e2d', textDecoration: 'underline', cursor: 'pointer' }}>Remove</button>
                               </div>
                             </div>
@@ -1912,7 +2191,7 @@ export default function App() {
                         <p style={{ color: '#666', fontSize: '0.8rem', marginBottom: 0 }}>Courier charges are billed separately after your order is confirmed.</p>
                         {unavailableLines.length > 0 && (
                           <p role="alert" style={{ color: '#8b1e2d', fontSize: '0.85rem', marginBottom: 0 }}>
-                            No longer available: {unavailableLines.map(line => line.product.name).join(', ')}. Please remove {unavailableLines.length === 1 ? 'it' : 'them'} to continue.
+                            Please update or remove: {unavailableLines.map(line => line.product.name).join(', ')}. {unavailableLines.length === 1 ? 'It is' : 'They are'} no longer available, or there is not enough stock.
                           </p>
                         )}
                       </div>
@@ -2131,6 +2410,53 @@ export default function App() {
         )}
 
       </div>
+
+      {!isStaff && (
+        <div style={{ position: 'fixed', right: '16px', bottom: '16px', zIndex: 900, display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '0.6rem' }}>
+          {isEnquiryOpen && (
+            <div role="dialog" aria-label="Send us an enquiry" style={{ width: 'min(330px, calc(100vw - 32px))', maxHeight: '80vh', overflowY: 'auto', backgroundColor: '#fff', borderRadius: '12px', boxShadow: '0 8px 30px rgba(0,0,0,0.25)' }}>
+              <div style={{ backgroundColor: '#075e54', color: '#fff', padding: '0.8rem 1rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <div>
+                  <strong>Mala Royale</strong>
+                  <div style={{ fontSize: '0.75rem', opacity: 0.85 }}>Ask us anything. We reply on WhatsApp.</div>
+                </div>
+                <button type="button" aria-label="Close chat" onClick={() => setIsEnquiryOpen(false)} style={{ background: 'none', border: 'none', color: '#fff', fontSize: '1.2rem', cursor: 'pointer' }}>✕</button>
+              </div>
+              {enquirySent ? (
+                <div style={{ padding: '1.3rem', textAlign: 'center', backgroundColor: '#ece5dd' }}>
+                  <div style={{ fontSize: '2rem' }} aria-hidden="true">✅</div>
+                  <strong>Enquiry sent!</strong>
+                  <p style={{ color: '#555', fontSize: '0.85rem' }}>We will reply to you on WhatsApp shortly.</p>
+                  <button type="button" onClick={() => { setEnquirySent(false); setEnquiryProduct(null); setIsEnquiryOpen(false); }} style={{ backgroundColor: '#25d366', color: '#fff', border: 'none', borderRadius: '8px', padding: '0.55rem 1.2rem', fontWeight: 'bold', cursor: 'pointer' }}>Close</button>
+                </div>
+              ) : (
+                <div style={{ padding: '0.9rem', display: 'grid', gap: '0.6rem', backgroundColor: '#ece5dd' }}>
+                  {enquiryProduct && (
+                    <div style={{ fontSize: '0.8rem', backgroundColor: '#fff', borderRadius: '6px', padding: '0.4rem 0.6rem', display: 'flex', justifyContent: 'space-between', gap: '0.5rem', alignItems: 'center' }}>
+                      <span>About: <strong>{enquiryProduct.name}</strong></span>
+                      <button type="button" aria-label="Remove product from enquiry" onClick={() => setEnquiryProduct(null)} style={{ background: 'none', border: 'none', cursor: 'pointer' }}>✕</button>
+                    </div>
+                  )}
+                  <input aria-label="Your name" placeholder="Your name *" maxLength={80} value={enquiryName} onChange={event => setEnquiryName(event.target.value)} style={{ padding: '0.5rem', borderRadius: '6px', border: '1px solid #ccc' }} />
+                  <input aria-label="Your WhatsApp number" type="tel" inputMode="numeric" placeholder="Your WhatsApp number *" maxLength={16} value={enquiryPhone} onChange={event => setEnquiryPhone(event.target.value)} style={{ padding: '0.5rem', borderRadius: '6px', border: '1px solid #ccc' }} />
+                  <textarea aria-label="Your message" rows={4} maxLength={1000} placeholder="Type your question *" value={enquiryMessage} onChange={event => setEnquiryMessage(event.target.value)} style={{ padding: '0.5rem', borderRadius: '6px', border: '1px solid #ccc', resize: 'vertical' }} />
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.4rem' }}>
+                    {['Is this available?', 'What are the courier charges?', 'I want a custom Kuchu'].map(chip => (
+                      <button key={chip} type="button" onClick={() => setEnquiryMessage(chip)} style={{ backgroundColor: '#fff', border: '1px solid #bbb', borderRadius: '999px', padding: '0.25rem 0.6rem', fontSize: '0.75rem', cursor: 'pointer' }}>{chip}</button>
+                    ))}
+                  </div>
+                  {enquiryError && <p role="alert" style={{ color: '#b00020', margin: 0, fontSize: '0.8rem' }}>{enquiryError}</p>}
+                  <button type="button" disabled={enquirySending} onClick={() => void sendEnquiry()} style={{ backgroundColor: '#25d366', color: '#fff', border: 'none', borderRadius: '8px', padding: '0.65rem', fontWeight: 'bold', cursor: enquirySending ? 'not-allowed' : 'pointer', opacity: enquirySending ? 0.7 : 1 }}>{enquirySending ? 'Sending...' : 'Send enquiry'}</button>
+                  <small style={{ color: '#555' }}>We will reply to you on WhatsApp at the number you enter.</small>
+                </div>
+              )}
+            </div>
+          )}
+          <button type="button" aria-label="Chat with us" onClick={() => (isEnquiryOpen ? setIsEnquiryOpen(false) : openEnquiry())} style={{ width: '58px', height: '58px', borderRadius: '50%', backgroundColor: '#25d366', border: 'none', boxShadow: '0 4px 14px rgba(0,0,0,0.3)', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            <WhatsAppIcon />
+          </button>
+        </div>
+      )}
     </div>
   );
 }
