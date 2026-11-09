@@ -1,0 +1,295 @@
+/* ===================== 3D brand banner ===================== */
+.mr-hero {
+  position: relative;
+  overflow: hidden;
+  min-height: 150px;
+  padding: 22px 16px;
+  perspective: 1000px;
+  background:
+    radial-gradient(circle at 15% 20%, rgba(255, 214, 140, 0.22), transparent 45%),
+    radial-gradient(circle at 85% 80%, rgba(255, 120, 170, 0.25), transparent 50%),
+    linear-gradient(120deg, #3f0c22 0%, #6e1a3a 48%, #9b2c5a 100%);
+  color: #fff;
+}
+
+.mr-hero::before,
+.mr-hero::after {
+  content: '';
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(30px);
+  opacity: 0.55;
+  pointer-events: none;
+  animation: mr-drift 9s ease-in-out infinite alternate;
+}
+.mr-hero::before { width: 180px; height: 180px; top: -60px; left: 8%; background: rgba(255, 196, 120, 0.45); }
+.mr-hero::after { width: 220px; height: 220px; bottom: -90px; right: 6%; background: rgba(255, 100, 160, 0.4); animation-delay: -4s; }
+
+.mr-hero-card {
+  --rx: 0deg;
+  --ry: 0deg;
+  position: relative;
+  max-width: 1100px;
+  margin: 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  padding: 18px 26px;
+  border-radius: 22px;
+  background: rgba(255, 255, 255, 0.09);
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  backdrop-filter: blur(10px) saturate(130%);
+  -webkit-backdrop-filter: blur(10px) saturate(130%);
+  box-shadow: 0 26px 50px rgba(0, 0, 0, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.38);
+  transform: rotateX(var(--rx)) rotateY(var(--ry));
+  transform-style: preserve-3d;
+  transition: transform 0.18s ease-out;
+  will-change: transform;
+}
+
+.mr-hero-logo {
+  flex: 0 0 auto;
+  width: 96px;
+  height: 96px;
+  padding: 6px;
+  border-radius: 22px;
+  background: #fff;
+  object-fit: contain;
+  box-shadow: 0 16px 30px rgba(0, 0, 0, 0.42);
+  transform: translateZ(64px);
+  animation: mr-float 5s ease-in-out infinite;
+}
+
+.mr-hero-monogram {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: Georgia, serif;
+  font-size: 2rem;
+  font-weight: bold;
+  color: #6e1a3a;
+}
+
+.mr-hero-copy { min-width: 0; transform-style: preserve-3d; }
+
+.mr-hero-title {
+  margin: 0;
+  font-family: Georgia, 'Times New Roman', serif;
+  font-size: clamp(2rem, 5.2vw, 3.5rem);
+  line-height: 1.05;
+  letter-spacing: 0.04em;
+  color: #fff3d6;
+  transform: translateZ(44px);
+  /* stacked offsets build an extruded gold edge, then a soft shadow lifts it off the glass */
+  text-shadow:
+    1px 1px 0 #e0ae52, 2px 2px 0 #cc9835, 3px 3px 0 #b3822a,
+    4px 4px 0 #946a1f, 5px 5px 0 #7a5718, 6px 10px 16px rgba(0, 0, 0, 0.5);
+}
+
+.mr-hero-tagline {
+  margin: 8px 0 0;
+  font-style: italic;
+  font-size: clamp(0.9rem, 2.2vw, 1.15rem);
+  color: rgba(255, 255, 255, 0.92);
+  transform: translateZ(26px);
+}
+
+@keyframes mr-float {
+  0%, 100% { transform: translateZ(64px) translateY(0); }
+  50% { transform: translateZ(64px) translateY(-6px); }
+}
+@keyframes mr-drift {
+  from { transform: translate3d(0, 0, 0); }
+  to { transform: translate3d(24px, 14px, 0); }
+}
+
+@media (max-width: 560px) {
+  .mr-hero { padding: 14px 10px; min-height: 130px; }
+  .mr-hero-card { gap: 14px; padding: 14px 16px; }
+  .mr-hero-logo { width: 68px; height: 68px; border-radius: 16px; }
+}
+
+/* ===================== offer banners ===================== */
+.mr-offer-slot {
+  position: sticky;
+  top: 0;
+  z-index: 800;
+  min-height: 82px;          /* reserved so offers appearing or changing never shift the page */
+  padding: 8px 12px 0;
+  pointer-events: none;
+}
+
+.mr-offer {
+  --mr-from: rgba(110, 26, 58, 0.9);
+  --mr-to: rgba(170, 52, 98, 0.78);
+  pointer-events: auto;
+  position: relative;
+  overflow: hidden;
+  max-width: 1100px;
+  height: 68px;
+  margin: 0 auto;
+  padding: 0 12px 0 10px;
+  display: grid;
+  grid-template-columns: 52px minmax(0, 1fr) auto 28px;
+  align-items: center;
+  gap: 12px;
+  border-radius: 16px;
+  color: #fff;
+  background: linear-gradient(135deg, var(--mr-from), var(--mr-to));
+  border: 1px solid rgba(255, 255, 255, 0.34);
+  backdrop-filter: blur(14px) saturate(140%);
+  -webkit-backdrop-filter: blur(14px) saturate(140%);
+  box-shadow: 0 12px 30px rgba(60, 10, 30, 0.32), inset 0 1px 0 rgba(255, 255, 255, 0.35);
+}
+
+.mr-accent-gold { --mr-from: rgba(150, 100, 14, 0.92); --mr-to: rgba(214, 160, 40, 0.8); }
+.mr-accent-emerald { --mr-from: rgba(14, 92, 70, 0.92); --mr-to: rgba(34, 150, 110, 0.8); }
+.mr-accent-rose { --mr-from: rgba(160, 30, 70, 0.92); --mr-to: rgba(224, 70, 110, 0.8); }
+
+.mr-offer-in { animation: mr-offer-in 0.34s cubic-bezier(0.2, 0.8, 0.2, 1) both; }
+.mr-offer-out { animation: mr-offer-out 0.24s ease-in both; }
+
+@keyframes mr-offer-in {
+  from { opacity: 0; transform: translate3d(0, -14px, 0) scale(0.98); }
+  to { opacity: 1; transform: translate3d(0, 0, 0) scale(1); }
+}
+@keyframes mr-offer-out {
+  from { opacity: 1; transform: translate3d(0, 0, 0) scale(1); }
+  to { opacity: 0; transform: translate3d(0, -10px, 0) scale(0.98); }
+}
+
+.mr-offer-media {
+  width: 52px;
+  height: 52px;
+  border-radius: 12px;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.18);
+}
+.mr-offer-media img { width: 100%; height: 100%; object-fit: cover; opacity: 0; transition: opacity 0.3s ease; }
+.mr-offer-media img.is-loaded { opacity: 1; }
+.mr-offer-glyph { font-size: 1.4rem; }
+
+.mr-offer-copy { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.mr-offer-badge {
+  align-self: flex-start;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  background: rgba(255, 255, 255, 0.22);
+  border: 1px solid rgba(255, 255, 255, 0.35);
+}
+.mr-offer-headline {
+  font-size: 0.98rem;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.mr-offer-sub {
+  font-size: 0.78rem;
+  opacity: 0.9;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mr-offer-cta {
+  position: relative;
+  overflow: hidden;
+  border: none;
+  cursor: pointer;
+  padding: 9px 16px;
+  border-radius: 999px;
+  font-weight: 700;
+  font-size: 0.85rem;
+  color: #4a0f27;
+  background: #fff;
+  box-shadow: 0 6px 14px rgba(0, 0, 0, 0.25);
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+  white-space: nowrap;
+}
+.mr-offer-cta::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: -60%;
+  width: 40%;
+  height: 100%;
+  background: linear-gradient(100deg, transparent, rgba(255, 220, 160, 0.7), transparent);
+  transform: skewX(-20deg);
+}
+.mr-offer-cta:hover { transform: translateY(-1px); box-shadow: 0 10px 20px rgba(0, 0, 0, 0.3); }
+.mr-offer-cta:hover::after { left: 130%; transition: left 0.6s ease; }
+.mr-offer-cta:active { transform: scale(0.96); }
+.mr-offer-cta:focus-visible, .mr-offer-close:focus-visible, .mr-offer-dot:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+
+.mr-offer-close {
+  width: 28px;
+  height: 28px;
+  border: none;
+  border-radius: 50%;
+  cursor: pointer;
+  color: #fff;
+  background: rgba(255, 255, 255, 0.18);
+  transition: background 0.15s ease, transform 0.15s ease;
+}
+.mr-offer-close:hover { background: rgba(255, 255, 255, 0.32); transform: rotate(90deg); }
+
+.mr-offer-dots {
+  position: absolute;
+  left: 50%;
+  bottom: 4px;
+  display: flex;
+  gap: 5px;
+  transform: translateX(-50%);
+}
+.mr-offer-dot {
+  width: 6px;
+  height: 6px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  cursor: pointer;
+  background: rgba(255, 255, 255, 0.4);
+  transition: transform 0.2s ease, background 0.2s ease;
+}
+.mr-offer-dot.is-active { background: #fff; transform: scale(1.3); }
+
+@media (max-width: 640px) {
+  .mr-offer-slot { min-height: 80px; }
+  .mr-offer { grid-template-columns: 44px minmax(0, 1fr) auto 26px; gap: 8px; padding: 0 8px; }
+  .mr-offer-media { width: 44px; height: 44px; }
+  .mr-offer-sub { display: none; }
+  .mr-offer-cta { padding: 8px 12px; font-size: 0.78rem; }
+}
+
+/* ===================== product-card badges ===================== */
+.mr-badge {
+  display: inline-block;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  color: #fff;
+  background: linear-gradient(135deg, #6e1a3a, #b03466);
+  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.25);
+}
+.mr-badge-new { background: linear-gradient(135deg, #0e7a5a, #22a572); animation: mr-badge-pulse 2.4s ease-in-out infinite; }
+@keyframes mr-badge-pulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.06); }
+}
+
+/* ===================== reduced motion ===================== */
+@media (prefers-reduced-motion: reduce) {
+  .mr-hero::before, .mr-hero::after, .mr-hero-logo, .mr-offer-in, .mr-offer-out, .mr-badge-new { animation: none; }
+  .mr-hero-card { transition: none; transform: none; }
+  .mr-offer-cta, .mr-offer-close, .mr-offer-dot, .mr-offer-media img { transition: none; }
+}
