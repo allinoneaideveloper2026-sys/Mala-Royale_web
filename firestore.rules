@@ -1,8 +1,14 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
+    // A Google account with a verified email (hosts, developer, and customers who signed in with Google).
     function signedIn() {
-      return request.auth != null && request.auth.token.email_verified == true;
+      return request.auth != null && request.auth.token.get('email_verified', false) == true;
+    }
+
+    // Any session, including guest customers who ordered without an account.
+    function hasSession() {
+      return request.auth != null;
     }
 
     function isDeveloper() {
@@ -31,15 +37,15 @@ service cloud.firestore {
     }
 
     match /orders/{orderId} {
-      allow create: if signedIn()
+      allow create: if hasSession()
         && request.resource.data.userId == request.auth.uid
         && request.resource.data.courierNoticeAccepted == true;
-      allow read: if isStaff() || (signedIn() && resource.data.userId == request.auth.uid);
+      allow read: if isStaff() || (hasSession() && resource.data.userId == request.auth.uid);
       allow update: if isStaff() || (
-        signedIn()
+        hasSession()
         && resource.data.userId == request.auth.uid
-        && resource.data.courierBill != null
-        && resource.data.courierPayment == null
+        && resource.data.get('courierBill', null) != null
+        && resource.data.get('courierPayment', null) == null
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['courierPayment', 'updatedAt'])
         && request.resource.data.courierPayment.keys().hasOnly(['paymentId', 'kind', 'amount', 'utr', 'screenshotUrl', 'verified', 'submittedAt'])
         && request.resource.data.courierPayment.kind == 'COURIER'
@@ -52,12 +58,37 @@ service cloud.firestore {
     }
 
     match /paymentReferences/{referenceId} {
-      allow get: if signedIn() && (
+      allow get: if hasSession() && (
         resource == null || resource.data.userId == request.auth.uid || isStaff()
       );
       allow list: if false;
-      allow create: if signedIn() && request.resource.data.userId == request.auth.uid;
+      allow create: if hasSession() && request.resource.data.userId == request.auth.uid;
       allow update, delete: if false;
+    }
+
+    // Customer enquiries from the website chat form. Only staff can read or manage them.
+    match /enquiries/{enquiryId} {
+      allow create: if hasSession()
+        && request.resource.data.keys().hasOnly(['userId', 'name', 'phone', 'message', 'productId', 'productName', 'status', 'createdAt'])
+        && request.resource.data.keys().hasAll(['userId', 'name', 'phone', 'message', 'status', 'createdAt'])
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.status == 'NEW'
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 80
+        && request.resource.data.phone is string
+        && request.resource.data.phone.matches('^[0-9]{10,15}$')
+        && request.resource.data.message is string
+        && request.resource.data.message.size() > 0
+        && request.resource.data.message.size() <= 1000
+        && request.resource.data.createdAt is string
+        && (!('productName' in request.resource.data) || request.resource.data.productName.size() <= 120);
+      allow read, update, delete: if isStaff();
+    }
+
+    // Private host data (the assistant's learned preferences). Staff only.
+    match /hostPrivate/{docId} {
+      allow read, write: if isStaff();
     }
 
     match /hostAccess/{email} {
@@ -67,6 +98,7 @@ service cloud.firestore {
       allow delete: if isDeveloper();
     }
 
+    // Saved addresses need a Google account so they follow the customer across devices.
     match /users/{userId}/addresses/{addressId} {
       allow read, write: if signedIn() && request.auth.uid == userId;
     }
