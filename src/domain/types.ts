@@ -30,6 +30,7 @@ export interface Product {
   media?: ProductMedia[];
   quantity?: number;
   status?: ProductStatus;
+  createdAt?: string;
 }
 
 export interface CustomerAddress {
@@ -101,7 +102,7 @@ export interface CourierBill {
 export interface Order {
   orderId: string;
   userId: string;
-  items: Array<{ productId: string; name: string; price: number; quantity: number }>;
+  items: Array<{ productId: string; name: string; price: number; regularPrice?: number; quantity: number }>;
   itemTotal: number;
   stage: OrderStage;
   isWithheld: boolean;
@@ -114,6 +115,8 @@ export interface Order {
   itemPayment?: PaymentRecord;
   courierBill?: CourierBill;
   courierPayment?: PaymentRecord;
+  deliveryPartner?: string;
+  deliveryComments?: string;
   createdAt: string;
   updatedAt: string;
 }
