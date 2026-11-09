@@ -5,6 +5,14 @@ import { TRANSLATIONS, Language } from './i18n';
 import { UserRole, Product, ProductMedia, ProductStatus, Enquiry, Order, CourierBill, CustomerAddress, ParcelDetails, ParcelParty, PincodeCheck, SavedDeliveryAddress } from './domain/types';
 import { globalOrderBook } from './domain/OrderBook';
 import { auth, firebaseConfigured } from './firebase';
+import AIOfferBannerContainer from './components/AIOfferBanner/AIOfferBannerContainer';
+import BrandHeroBanner from './components/AIOfferBanner/BrandHeroBanner';
+import { cardBadges, discountPercent, type OfferAction } from './components/AIOfferBanner/offerEngine';
+import { useBrowsingContext } from './components/AIOfferBanner/useBrowsingContext';
+import HostAnalytics from './components/host/HostAnalytics';
+import MasterLedger from './components/host/MasterLedger';
+import { adjustWeight } from './analytics/insights';
+import { productCreatedMs } from './analytics/orderMetrics';
 import {
   attachCloudCourierBill,
   authorizeHost,
@@ -22,9 +30,13 @@ import {
   publishProduct,
   revokeHost,
   saveCloudDeliveryAddress,
+  saveAiMemory,
+  saveCategories,
   saveCloudParcelDetails,
   setEnquiryStatus,
+  subscribeAiMemory,
   subscribeAuthorizedHosts,
+  subscribeCategories,
   subscribeCheckoutQr,
   subscribeEnquiries,
   subscribeSavedAddresses,
@@ -33,6 +45,7 @@ import {
   submitCloudOrderForDispatch,
   submitCloudCourierPayment,
   submitEnquiry,
+  updateOrderDelivery,
   updateProduct,
   uploadCheckoutQr,
   uploadProductMedia,
@@ -74,6 +87,11 @@ const MAX_VIDEO_SECONDS = 30;
 const LOGO_URL = 'https://res.cloudinary.com/yydehgmd/image/upload/w_400,q_auto,f_auto/v1793990131/MalaRoyale.jpg';
 
 type HostOrderTab = 'ACTIVE' | 'DISPATCHED' | 'HISTORY';
+type HostTab = 'ORDERS' | 'LEDGER' | 'UPLOAD' | 'CATALOG' | 'QR' | 'ENQUIRIES' | 'INSIGHTS';
+type SortKey = 'featured' | 'newest' | 'price-asc' | 'price-desc' | 'discount' | 'in-stock';
+
+const DEFAULT_CATEGORIES = ['Sarees', 'Custom Kuchu'];
+const NEW_CATEGORY_VALUE = '__new__';
 
 type CartLine = { product: Product; quantity: number };
 const MAX_CART_QUANTITY = 10;
@@ -180,15 +198,18 @@ function GoogleSignInButton({ onClick, disabled, label }: { onClick: () => void;
 
 function ProductManagerRow({
   product,
+  categories,
   onSave,
   onDelete,
 }: {
   product: Product;
-  onSave: (productId: string, changes: { name: string; price: number; offerPrice?: number; quantity: number; status: ProductStatus }) => Promise<void>;
+  categories: string[];
+  onSave: (productId: string, changes: { name: string; category: string; price: number; offerPrice?: number; quantity: number; status: ProductStatus }) => Promise<void>;
   onDelete: (product: Product) => Promise<void>;
 }) {
   const [editing, setEditing] = useState(false);
   const [name, setName] = useState(product.name);
+  const [category, setCategory] = useState(product.category);
   const [price, setPrice] = useState(String(product.price));
   const [offerPrice, setOfferPrice] = useState(product.offerPrice ? String(product.offerPrice) : '');
   const [quantity, setQuantity] = useState(typeof product.quantity === 'number' ? String(product.quantity) : '');
@@ -199,6 +220,7 @@ function ProductManagerRow({
 
   const openEditor = () => {
     setName(product.name);
+    setCategory(product.category);
     setPrice(String(product.price));
     setOfferPrice(product.offerPrice ? String(product.offerPrice) : '');
     setQuantity(typeof product.quantity === 'number' ? String(product.quantity) : '');
@@ -231,7 +253,7 @@ function ProductManagerRow({
     setBusy(true);
     setError('');
     try {
-      await onSave(product.id, { name: name.trim(), price: nextPrice, offerPrice: nextOffer, quantity: nextQuantity, status });
+      await onSave(product.id, { name: name.trim(), category, price: nextPrice, offerPrice: nextOffer, quantity: nextQuantity, status });
       setEditing(false);
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : 'Could not save the changes.');
@@ -278,6 +300,9 @@ function ProductManagerRow({
           <input aria-label="Regular price" type="number" min="1" step="0.01" placeholder="Regular price (₹)" value={price} onChange={event => setPrice(event.target.value)} required style={{ padding: '0.5rem' }} />
           <input aria-label="Offer price (leave blank for no offer)" type="number" min="1" step="0.01" placeholder="Offer price (blank = no offer)" value={offerPrice} onChange={event => setOfferPrice(event.target.value)} style={{ padding: '0.5rem' }} />
           <input aria-label="Quantity in stock" type="number" min="0" step="1" placeholder="Quantity in stock" value={quantity} onChange={event => setQuantity(event.target.value)} required style={{ padding: '0.5rem' }} />
+          <select aria-label="Category" value={category} onChange={event => setCategory(event.target.value)} style={{ padding: '0.5rem' }}>
+            {Array.from(new Set([...categories, product.category])).map(option => <option key={option} value={option}>{option}</option>)}
+          </select>
           <select aria-label="Availability" value={status} onChange={event => setStatus(event.target.value as ProductStatus)} style={{ padding: '0.5rem' }}>
             <option value="AVAILABLE">Available (auto "Out of stock" at 0)</option>
             <option value="COMING_SOON">Coming soon</option>
@@ -752,19 +777,23 @@ function MediaLightbox({
   );
 }
 
-function ProductGallery({ product }: { product: Product }) {
+function ProductGallery({ product, badges = [], onView }: { product: Product; badges?: string[]; onView?: () => void }) {
   const media: ProductMedia[] = product.media?.length
     ? product.media
     : [{ url: product.image, type: 'image' }];
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [viewerOpen, setViewerOpen] = useState(false);
   const selectedMedia = media[Math.min(selectedIndex, media.length - 1)];
+  const openViewer = () => {
+    setViewerOpen(true);
+    onView?.();
+  };
 
   useEffect(() => setSelectedIndex(0), [product.id]);
 
   return (
     <div>
-      <div className="mr-zoomable" style={{ position: 'relative', cursor: 'zoom-in' }} onClick={() => setViewerOpen(true)}>
+      <div className="mr-zoomable" style={{ position: 'relative', cursor: 'zoom-in' }} onClick={openViewer}>
         {selectedMedia.type === 'video' ? (
           <video src={selectedMedia.url} controls playsInline preload="metadata" onClick={event => event.stopPropagation()} style={{ width: '100%', height: '200px', objectFit: 'cover', display: 'block' }} />
         ) : (
@@ -773,11 +802,18 @@ function ProductGallery({ product }: { product: Product }) {
         <button
           type="button"
           aria-label={`View ${product.name} full size`}
-          onClick={event => { event.stopPropagation(); setViewerOpen(true); }}
+          onClick={event => { event.stopPropagation(); openViewer(); }}
           style={{ position: 'absolute', top: '8px', right: '8px', backgroundColor: 'rgba(0,0,0,0.6)', color: '#fff', border: 'none', borderRadius: '999px', padding: '0.3rem 0.7rem', fontSize: '0.75rem', cursor: 'pointer' }}
         >
           ⤢ View full
         </button>
+        {badges.length > 0 && (
+          <div style={{ position: 'absolute', top: '8px', left: '8px', display: 'flex', flexDirection: 'column', gap: '4px', pointerEvents: 'none' }}>
+            {badges.map(badge => (
+              <span key={badge} className={`mr-badge${badge === 'NEW' ? ' mr-badge-new' : ''}`}>{badge}</span>
+            ))}
+          </div>
+        )}
       </div>
       {media.length > 1 && (
         <div style={{ display: 'flex', gap: '0.4rem', overflowX: 'auto', padding: '0.5rem' }}>
@@ -821,6 +857,15 @@ export default function App() {
   // Catalog State
   const [products, setProducts] = useState<Product[]>(firebaseConfigured ? [] : INITIAL_CATALOG);
   const [categoryFilter, setCategoryFilter] = useState<string>('All');
+  const [sortBy, setSortBy] = useState<SortKey>('featured');
+  const [onlyInStock, setOnlyInStock] = useState(false);
+  const [onlyOffers, setOnlyOffers] = useState(false);
+  const [hostTab, setHostTab] = useState<HostTab>('ORDERS');
+  const [customCategories, setCustomCategories] = useState<string[]>([]);
+  const [addingCategory, setAddingCategory] = useState(false);
+  const [newCategoryName, setNewCategoryName] = useState('');
+  const [paymentQrUpdatedAt, setPaymentQrUpdatedAt] = useState('');
+  const [aiWeights, setAiWeights] = useState<Record<string, number>>({});
   const [newProduct, setNewProduct] = useState({ name: '', category: 'Sarees', price: '', offerPrice: '', quantity: '1', description: '', image: '' });
   const [productMediaFiles, setProductMediaFiles] = useState<File[]>([]);
   const [paymentQrUrl, setPaymentQrUrl] = useState('');
@@ -886,6 +931,9 @@ export default function App() {
     isVideo: file.type.startsWith('video/'),
   })), [productMediaFiles]);
   useEffect(() => () => mediaPreviews.forEach(preview => URL.revokeObjectURL(preview.url)), [mediaPreviews]);
+
+  // Browsing context for personalised offers (kept in the visitor's own browser; off for host and developer).
+  const { context: browsingContext, trackProductView, trackAddToCart, dismissOffer } = useBrowsingContext(categoryFilter, !isStaff);
 
   const applySignedInUser = async (user: User | null) => {
     setFirebaseUser(user);
@@ -970,9 +1018,20 @@ export default function App() {
 
   useEffect(() => {
     if (!firebaseConfigured) return;
-    return subscribeCheckoutQr(url => {
+    return subscribeCategories(setCustomCategories, error => setSyncError(error.message));
+  }, []);
+
+  useEffect(() => {
+    if (!firebaseConfigured || !isStaff) return;
+    return subscribeAiMemory(setAiWeights, error => setSyncError(error.message));
+  }, [isStaff]);
+
+  useEffect(() => {
+    if (!firebaseConfigured) return;
+    return subscribeCheckoutQr((url, updatedAt) => {
       setSyncError('');
       setPaymentQrUrl(url);
+      setPaymentQrUpdatedAt(updatedAt || '');
     }, error => setSyncError(error.message));
   }, []);
 
@@ -1155,6 +1214,7 @@ export default function App() {
         price: regularValue,
         ...(offerValue !== undefined ? { offerPrice: offerValue } : {}),
         quantity: quantityValue,
+        createdAt: new Date().toISOString(),
         description: newProduct.description || 'Exclusive boutique craftsmanship.',
         image: coverImage,
         media,
@@ -1183,6 +1243,7 @@ export default function App() {
         ? await withTimeout(uploadCheckoutQr(paymentQrFile), 60000, 'Saving the checkout QR is taking too long. Check your internet connection and try again.')
         : URL.createObjectURL(paymentQrFile);
       setPaymentQrUrl(url);
+      setPaymentQrUpdatedAt(new Date().toISOString());
       setPaymentQrFile(null);
       alert(firebaseConfigured ? 'Checkout QR updated for all customers.' : 'Checkout QR updated in this local demo.');
     } catch (error) {
@@ -1212,7 +1273,7 @@ export default function App() {
   // Host Action: Edit or remove a published product
   const handleUpdateProduct = async (
     productId: string,
-    changes: { name: string; price: number; offerPrice?: number; quantity: number; status: ProductStatus },
+    changes: { name: string; category: string; price: number; offerPrice?: number; quantity: number; status: ProductStatus },
   ) => {
     try {
       if (firebaseConfigured) {
@@ -1323,6 +1384,89 @@ export default function App() {
     window.open(`https://wa.me/?text=${encodeURIComponent(text)}`, '_blank', 'noopener,noreferrer');
   };
 
+  // Host: categories, delivery details, assistant feedback
+  const handleAddCategory = async () => {
+    const name = newCategoryName.trim().replace(/\s+/g, ' ').slice(0, 40);
+    if (!name) {
+      alert('Enter a category name.');
+      return;
+    }
+    const existing = categoryOptions.find(option => option.toLowerCase() === name.toLowerCase());
+    if (existing) {
+      setNewProduct(current => ({ ...current, category: existing }));
+      setAddingCategory(false);
+      setNewCategoryName('');
+      return;
+    }
+    try {
+      const nextCustom = [...customCategories, name];
+      if (firebaseConfigured) {
+        await withTimeout(saveCategories(nextCustom), 30000, 'Saving the category is taking too long. Check your internet connection and try again.');
+      }
+      setCustomCategories(nextCustom);
+      setNewProduct(current => ({ ...current, category: name }));
+      setAddingCategory(false);
+      setNewCategoryName('');
+    } catch (error) {
+      setSyncError(error instanceof Error ? error.message : 'Could not add the category.');
+    }
+  };
+
+  const handleRemoveCategory = async (name: string) => {
+    if (!confirmHostAction(`Remove the category "${name}"?`)) return;
+    try {
+      const nextCustom = customCategories.filter(option => option !== name);
+      if (firebaseConfigured) {
+        await withTimeout(saveCategories(nextCustom), 30000, 'Removing the category is taking too long. Check your internet connection and try again.');
+      }
+      setCustomCategories(nextCustom);
+      if (newProduct.category === name) setNewProduct(current => ({ ...current, category: DEFAULT_CATEGORIES[0] }));
+    } catch (error) {
+      setSyncError(error instanceof Error ? error.message : 'Could not remove the category.');
+    }
+  };
+
+  const handleUpdateDelivery = async (orderId: string, deliveryPartner: string, deliveryComments: string) => {
+    try {
+      if (firebaseConfigured) {
+        await withTimeout(updateOrderDelivery(orderId, deliveryPartner, deliveryComments), 30000, 'Saving is taking too long. Check your internet connection and try again.');
+      } else {
+        setActiveOrders(current => current.map(order => order.orderId === orderId ? { ...order, deliveryPartner, deliveryComments } : order));
+      }
+    } catch (error) {
+      setSyncError(error instanceof Error ? error.message : 'Could not save the delivery details.');
+      throw error;
+    }
+  };
+
+  const handleInsightFeedback = (insightKey: string, useful: boolean) => {
+    const next = { ...aiWeights, [insightKey]: adjustWeight(aiWeights[insightKey], useful) };
+    setAiWeights(next);
+    if (firebaseConfigured) {
+      void saveAiMemory(next).catch(error => setSyncError(error instanceof Error ? error.message : 'Could not save your feedback.'));
+    }
+  };
+
+  // Customer: act on a banner button
+  const handleOfferAction = (action: OfferAction) => {
+    setCustomerTab('SHOP');
+    if (action.type === 'shop-category') {
+      setCategoryFilter(action.category);
+      setOnlyOffers(Boolean(action.onlyOffers));
+    } else if (action.type === 'show-new') {
+      setCategoryFilter('All');
+      setOnlyOffers(false);
+      setSortBy('newest');
+    } else if (action.type === 'show-offers') {
+      setCategoryFilter('All');
+      setOnlyOffers(true);
+    } else if (action.type === 'open-cart') {
+      setIsCartOpen(true);
+      return;
+    }
+    window.setTimeout(() => document.getElementById('mr-catalog')?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 60);
+  };
+
   // Cart Management
   const addToCart = (product: Product) => isPurchasable(product) && setCart(current => (
     current.some(line => line.product.id === product.id)
@@ -1391,7 +1535,7 @@ export default function App() {
           return;
         }
       }
-      const orderItems = cart.map(line => ({ productId: line.product.id, name: line.product.name, price: unitPrice(line.product), quantity: line.quantity }));
+      const orderItems = cart.map(line => ({ productId: line.product.id, name: line.product.name, price: unitPrice(line.product), regularPrice: line.product.price, quantity: line.quantity }));
       const deliveryAddress: CustomerAddress = {
         ...address,
         street: [address.houseNameOrNumber, address.street1, address.street2].filter(Boolean).join(', '),
@@ -1651,9 +1795,26 @@ export default function App() {
     setAddress({ ...savedAddress, consentTimestamp: '', street: savedAddress.street || '' });
   };
 
-  const filteredProducts = categoryFilter === 'All'
-    ? products
-    : products.filter(p => p.category === categoryFilter);
+  const categoryOptions = Array.from(new Set([
+    ...DEFAULT_CATEGORIES,
+    ...customCategories,
+    ...products.map(product => product.category).filter(Boolean),
+  ]));
+
+  const filteredProducts = (() => {
+    let list = categoryFilter === 'All' ? products : products.filter(product => product.category === categoryFilter);
+    if (onlyInStock) list = list.filter(isPurchasable);
+    if (onlyOffers) list = list.filter(product => discountPercent(product) > 0);
+    const sorted = [...list];
+    if (sortBy === 'newest') sorted.sort((left, right) => productCreatedMs(right) - productCreatedMs(left));
+    else if (sortBy === 'price-asc') sorted.sort((left, right) => unitPrice(left) - unitPrice(right));
+    else if (sortBy === 'price-desc') sorted.sort((left, right) => unitPrice(right) - unitPrice(left));
+    else if (sortBy === 'discount') sorted.sort((left, right) => discountPercent(right) - discountPercent(left));
+    else if (sortBy === 'in-stock') sorted.sort((left, right) => Number(isPurchasable(right)) - Number(isPurchasable(left)));
+    return sorted;
+  })();
+
+  const newEnquiryCount = enquiries.filter(item => item.status === 'NEW').length;
 
   const firstInFirstOut = (left: Order, right: Order) => left.createdAt.localeCompare(right.createdAt);
   const hostActiveOrders = activeOrders
@@ -1724,14 +1885,18 @@ export default function App() {
       ) : null}
 
       {/* BOUTIQUE BRANDING */}
-      <header style={{ backgroundColor: '#6e1a3a', color: '#fff', padding: '1.5rem', textAlign: 'center' }}>
-        <h1 style={{ margin: 0, fontSize: '2.4rem' }}>
-          {logoFailed ? t.appName : (
-            <img src={LOGO_URL} alt={t.appName} onError={() => setLogoFailed(true)} style={{ height: '80px', maxWidth: '100%', objectFit: 'contain' }} />
-          )}
-        </h1>
-        <p style={{ margin: '0.3rem 0 0', fontStyle: 'italic', opacity: 0.9 }}>{t.tagline}</p>
-      </header>
+      <BrandHeroBanner logoUrl={LOGO_URL} name={t.appName} tagline={t.tagline} />
+
+      {!isStaff && (
+        <AIOfferBannerContainer
+          products={products}
+          context={browsingContext}
+          activeCategory={categoryFilter}
+          cartCount={cartCount}
+          onAction={handleOfferAction}
+          onDismiss={dismissOffer}
+        />
+      )}
 
       {/* MAIN CONTENT AREA */}
       <div style={{ maxWidth: '1100px', margin: '2rem auto', padding: '0 1rem' }}>
@@ -1785,16 +1950,53 @@ export default function App() {
           <div style={{ backgroundColor: '#fff', padding: '1.8rem', borderRadius: '10px', boxShadow: '0 2px 10px rgba(0,0,0,0.08)' }}>
             <h2 style={{ color: '#6e1a3a', marginTop: 0 }}>🏪 Host Management Panel</h2>
 
+            <div role="tablist" aria-label="Host sections" style={{ display: 'flex', gap: '0.3rem', overflowX: 'auto', borderBottom: '1px solid #ddd', margin: '0 0 1.2rem' }}>
+              {([
+                ['ORDERS', `Orders (${hostActiveOrders.length})`],
+                ['LEDGER', 'Master ledger'],
+                ['UPLOAD', 'Upload item'],
+                ['CATALOG', `Manage catalog (${products.length})`],
+                ['QR', 'Payment QR'],
+                ['ENQUIRIES', `Enquiries${newEnquiryCount ? ` (${newEnquiryCount} new)` : ''}`],
+                ['INSIGHTS', 'AI insights'],
+              ] as const).map(([tab, label]) => (
+                <button key={tab} type="button" role="tab" aria-selected={hostTab === tab} onClick={() => setHostTab(tab)} style={{ padding: '0.65rem 0.9rem', border: 0, borderBottom: hostTab === tab ? '3px solid #6e1a3a' : '3px solid transparent', background: 'transparent', color: '#6e1a3a', fontWeight: 'bold', cursor: 'pointer', whiteSpace: 'nowrap' }}>
+                  {label}
+                </button>
+              ))}
+            </div>
+
+            {hostTab === 'UPLOAD' && (<>
             {/* Catalog Upload Form */}
             <div style={{ backgroundColor: '#f7ebe8', padding: '1.2rem', borderRadius: '8px', marginBottom: '2rem' }}>
               <h3 style={{ margin: '0 0 1rem' }}>Upload New Catalog Item</h3>
               {firebaseConfigured && (!CONFIG.cloudinary.cloudName || !CONFIG.cloudinary.uploadPreset) && <p role="status" style={{ color: '#8a4b08', fontSize: '0.85rem' }}>Configure VITE_CLOUDINARY_CLOUD_NAME and VITE_CLOUDINARY_UPLOAD_PRESET to upload product media. You can still use a hosted image URL.</p>}
               <form onSubmit={handlePublishProduct} style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '0.8rem' }}>
                 <input type="text" placeholder="Product Name *" value={newProduct.name} onChange={e => setNewProduct({ ...newProduct, name: e.target.value })} required style={{ padding: '0.6rem' }} />
-                <select value={newProduct.category} onChange={e => setNewProduct({ ...newProduct, category: e.target.value })} style={{ padding: '0.6rem' }}>
-                  <option value="Sarees">Sarees</option>
-                  <option value="Custom Kuchu">Custom Kuchu</option>
-                </select>
+                <div style={{ display: 'grid', gap: '0.4rem' }}>
+                  <select
+                    aria-label="Category"
+                    value={newProduct.category}
+                    onChange={e => {
+                      if (e.target.value === NEW_CATEGORY_VALUE) {
+                        setAddingCategory(true);
+                      } else {
+                        setAddingCategory(false);
+                        setNewProduct({ ...newProduct, category: e.target.value });
+                      }
+                    }}
+                    style={{ padding: '0.6rem' }}
+                  >
+                    {categoryOptions.map(option => <option key={option} value={option}>{option}</option>)}
+                    <option value={NEW_CATEGORY_VALUE}>➕ Add new category...</option>
+                  </select>
+                  {addingCategory && (
+                    <div style={{ display: 'flex', gap: '0.4rem' }}>
+                      <input aria-label="New category name" placeholder="New category name" maxLength={40} value={newCategoryName} onChange={e => setNewCategoryName(e.target.value)} style={{ padding: '0.5rem', flex: 1, minWidth: 0 }} />
+                      <button type="button" onClick={() => void handleAddCategory()} style={{ backgroundColor: '#6e1a3a', color: '#fff', border: 'none', borderRadius: '4px', padding: '0.5rem 0.8rem', cursor: 'pointer', fontWeight: 'bold' }}>Add</button>
+                    </div>
+                  )}
+                </div>
                 <input type="number" placeholder="Regular Price (₹) *" value={newProduct.price} onChange={e => setNewProduct({ ...newProduct, price: e.target.value })} required style={{ padding: '0.6rem' }} />
                 <input type="number" min="1" step="0.01" aria-label="Offer price (leave blank for no offer)" placeholder="Offer Price (₹) - blank = no offer" value={newProduct.offerPrice} onChange={e => setNewProduct({ ...newProduct, offerPrice: e.target.value })} style={{ padding: '0.6rem' }} />
                 <input type="number" min="0" step="1" aria-label="Quantity in stock" placeholder="Quantity in stock *" value={newProduct.quantity} onChange={e => setNewProduct({ ...newProduct, quantity: e.target.value })} required style={{ padding: '0.6rem' }} />
@@ -1840,9 +2042,14 @@ export default function App() {
               </form>
             </div>
 
+            </>)}
+            {hostTab === 'QR' && (<>
             <div style={{ backgroundColor: '#fff', padding: '1.2rem', border: '1px solid #ddd', borderRadius: '8px', marginBottom: '2rem' }}>
               <h3 style={{ margin: '0 0 0.6rem' }}>Checkout Payment QR</h3>
               <p style={{ margin: '0 0 0.8rem', color: '#666', fontSize: '0.9rem' }}>Customers will see this QR during checkout.</p>
+              <p style={{ margin: '0 0 0.8rem', fontSize: '0.85rem', color: paymentQrUrl ? '#1b5e20' : '#8a4b08' }}>
+                {paymentQrUpdatedAt ? `Last updated: ${new Date(paymentQrUpdatedAt).toLocaleString()}` : paymentQrUrl ? 'Last updated: not recorded' : 'No QR uploaded yet.'}
+              </p>
               {firebaseConfigured && (!CONFIG.cloudinary.cloudName || !CONFIG.cloudinary.uploadPreset) && <p role="status" style={{ color: '#8a4b08', fontSize: '0.85rem' }}>Configure VITE_CLOUDINARY_CLOUD_NAME and VITE_CLOUDINARY_UPLOAD_PRESET in the deployment environment to upload images.</p>}
               {paymentQrUrl && <img src={paymentQrUrl} alt="Current checkout payment QR" style={{ width: '160px', height: '160px', objectFit: 'contain', display: 'block', marginBottom: '0.8rem' }} />}
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.7rem', alignItems: 'center' }}>
@@ -1853,6 +2060,8 @@ export default function App() {
               </div>
             </div>
 
+            </>)}
+            {hostTab === 'ENQUIRIES' && (<>
             {/* Customer enquiries */}
             <div style={{ backgroundColor: '#fff', padding: '1.2rem', border: '1px solid #ddd', borderRadius: '8px', marginBottom: '2rem' }}>
               <h3 style={{ margin: '0 0 0.3rem' }}>Customer enquiries ({enquiries.filter(item => item.status === 'NEW').length} new)</h3>
@@ -1884,10 +2093,25 @@ export default function App() {
               )}
             </div>
 
+            </>)}
+            {hostTab === 'CATALOG' && (<>
             {/* Manage catalog */}
             <div style={{ backgroundColor: '#fff', padding: '1.2rem', border: '1px solid #ddd', borderRadius: '8px', marginBottom: '2rem' }}>
               <h3 style={{ margin: '0 0 0.3rem' }}>Manage catalog ({products.length})</h3>
               <p style={{ margin: '0 0 0.8rem', color: '#666', fontSize: '0.85rem' }}>Edit prices and offers, mark an item out of stock or coming soon, or remove it.</p>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.4rem', alignItems: 'center', margin: '0 0 0.9rem' }}>
+                <strong style={{ fontSize: '0.85rem' }}>Categories:</strong>
+                {categoryOptions.map(option => {
+                  const inUse = products.some(product => product.category === option);
+                  const removable = customCategories.includes(option) && !inUse;
+                  return (
+                    <span key={option} style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem', backgroundColor: '#f1e6ea', color: '#6e1a3a', borderRadius: '999px', padding: '0.15rem 0.7rem', fontSize: '0.8rem' }}>
+                      {option}
+                      {removable && <button type="button" aria-label={`Remove category ${option}`} onClick={() => void handleRemoveCategory(option)} style={{ background: 'none', border: 'none', color: '#8b1e2d', cursor: 'pointer', padding: 0 }}>✕</button>}
+                    </span>
+                  );
+                })}
+              </div>
               {products.length === 0 ? (
                 <p style={{ margin: 0, color: '#666', fontStyle: 'italic' }}>No items published yet.</p>
               ) : (
@@ -1896,6 +2120,7 @@ export default function App() {
                     <ProductManagerRow
                       key={`${product.id}-${product.name}-${product.price}-${product.offerPrice ?? ''}-${product.status ?? ''}`}
                       product={product}
+                      categories={categoryOptions}
                       onSave={handleUpdateProduct}
                       onDelete={handleDeleteProduct}
                     />
@@ -1904,6 +2129,8 @@ export default function App() {
               )}
             </div>
 
+            </>)}
+            {hostTab === 'ORDERS' && (<>
             {/* Manage Incoming Orders */}
             <h3>Incoming Orders & Courier Billing</h3>
             <div role="tablist" aria-label="Host order queues" style={{ display: 'flex', gap: '0.4rem', borderBottom: '1px solid #ddd', margin: '0.8rem 0 1rem' }}>
@@ -1985,6 +2212,15 @@ export default function App() {
                 </article>
               );
             })}
+            </>)}
+
+            {hostTab === 'LEDGER' && (
+              <MasterLedger orders={activeOrders} products={products} onSaveDelivery={handleUpdateDelivery} />
+            )}
+
+            {hostTab === 'INSIGHTS' && (
+              <HostAnalytics orders={activeOrders} products={products} enquiries={enquiries} weights={aiWeights} onFeedback={handleInsightFeedback} />
+            )}
           </div>
         )}
 
@@ -2063,7 +2299,7 @@ export default function App() {
             {/* Filter Bar & Cart Button */}
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem', flexWrap: 'wrap', gap: '1rem' }}>
               <div>
-                {['All', 'Sarees', 'Custom Kuchu'].map(cat => (
+                {['All', ...categoryOptions].map(cat => (
                   <button
                     key={cat}
                     onClick={() => setCategoryFilter(cat)}
@@ -2091,11 +2327,39 @@ export default function App() {
               </button>
             </div>
 
+            {/* Sort and filter */}
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.8rem 1.2rem', alignItems: 'center', marginBottom: '1.2rem', fontSize: '0.9rem' }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                Sort by
+                <select value={sortBy} onChange={event => setSortBy(event.target.value as SortKey)} style={{ padding: '0.4rem' }}>
+                  <option value="featured">Featured</option>
+                  <option value="newest">Newest first</option>
+                  <option value="price-asc">Price: low to high</option>
+                  <option value="price-desc">Price: high to low</option>
+                  <option value="discount">Biggest discount</option>
+                  <option value="in-stock">In stock first</option>
+                </select>
+              </label>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', cursor: 'pointer' }}>
+                <input type="checkbox" checked={onlyInStock} onChange={event => setOnlyInStock(event.target.checked)} />
+                In stock only
+              </label>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', cursor: 'pointer' }}>
+                <input type="checkbox" checked={onlyOffers} onChange={event => setOnlyOffers(event.target.checked)} />
+                On offer
+              </label>
+              <span style={{ color: '#777' }}>{filteredProducts.length} item{filteredProducts.length === 1 ? '' : 's'}</span>
+              {(categoryFilter !== 'All' || onlyInStock || onlyOffers || sortBy !== 'featured') && (
+                <button type="button" onClick={() => { setCategoryFilter('All'); setOnlyInStock(false); setOnlyOffers(false); setSortBy('featured'); }} style={{ background: 'none', border: 'none', color: '#6e1a3a', textDecoration: 'underline', cursor: 'pointer' }}>Clear filters</button>
+              )}
+            </div>
+            {filteredProducts.length === 0 && <p role="status" style={{ color: '#666' }}>No items match these filters.</p>}
+
             {/* Catalog Grid */}
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(250px, 1fr))', gap: '1.8rem' }}>
+            <div id="mr-catalog" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(250px, 1fr))', gap: '1.8rem', scrollMarginTop: '100px' }}>
               {filteredProducts.map(product => (
                 <div key={product.id} style={{ backgroundColor: '#fff', borderRadius: '10px', overflow: 'hidden', boxShadow: '0 4px 12px rgba(0,0,0,0.08)', display: 'flex', flexDirection: 'column' }}>
-                  <ProductGallery product={product} />
+                  <ProductGallery product={product} badges={cardBadges(product)} onView={() => trackProductView(product.id, product.category)} />
                   <div style={{ padding: '1rem', flex: 1, display: 'flex', flexDirection: 'column', justifyContent: 'space-between' }}>
                     <div>
                       <span style={{ fontSize: '0.75rem', color: '#6e1a3a', fontWeight: 'bold', textTransform: 'uppercase' }}>{product.category}</span>
@@ -2123,7 +2387,7 @@ export default function App() {
                       {isPurchasable(product) ? (
                         <div style={{ display: 'flex', gap: '0.4rem' }}>
                           <button
-                            onClick={() => addToCart(product)}
+                            onClick={() => { addToCart(product); trackAddToCart(product.id, product.category); }}
                             style={{ backgroundColor: '#fff', color: '#6e1a3a', border: '1px solid #6e1a3a', padding: '0.45rem 0.65rem', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}
                           >
                             + Add
