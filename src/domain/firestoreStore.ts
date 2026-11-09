@@ -96,11 +96,12 @@ export async function publishProduct(product: Product): Promise<void> {
 
 export async function updateProduct(
   productId: string,
-  changes: { name: string; price: number; offerPrice?: number; quantity: number; status: ProductStatus },
+  changes: { name: string; category: string; price: number; offerPrice?: number; quantity: number; status: ProductStatus },
 ): Promise<void> {
   const db = requireFirestore();
   await updateDoc(doc(db, 'products', productId), {
     name: changes.name,
+    category: changes.category,
     price: changes.price,
     offerPrice: changes.offerPrice === undefined ? deleteField() : changes.offerPrice,
     quantity: changes.quantity,
@@ -131,10 +132,11 @@ export async function uploadProductMedia(files: File[]): Promise<ProductMedia[]>
   }));
 }
 
-export function subscribeCheckoutQr(onChange: (url: string) => void, onError: (error: Error) => void) {
+export function subscribeCheckoutQr(onChange: (url: string, updatedAt?: string) => void, onError: (error: Error) => void) {
   const db = requireFirestore();
   return onSnapshot(doc(db, 'settings', 'checkout'), snapshot => {
-    onChange(snapshot.exists() ? String(snapshot.data().paymentQrUrl || '') : '');
+    const data = snapshot.exists() ? snapshot.data() : undefined;
+    onChange(data ? String(data.paymentQrUrl || '') : '', data && typeof data.updatedAt === 'string' ? data.updatedAt : undefined);
   }, onError);
 }
 
@@ -540,4 +542,46 @@ export async function setEnquiryStatus(enquiryId: string, status: 'NEW' | 'REPLI
 export async function deleteEnquiry(enquiryId: string): Promise<void> {
   const db = requireFirestore();
   await deleteDoc(doc(db, 'enquiries', enquiryId));
+}
+
+export function subscribeCategories(onChange: (categories: string[]) => void, onError: (error: Error) => void) {
+  const db = requireFirestore();
+  return onSnapshot(doc(db, 'settings', 'categories'), snapshot => {
+    const list = snapshot.exists() ? snapshot.data().list : [];
+    onChange(Array.isArray(list) ? list.filter((item): item is string => typeof item === 'string') : []);
+  }, onError);
+}
+
+export async function saveCategories(categories: string[]): Promise<void> {
+  const db = requireFirestore();
+  await setDoc(doc(db, 'settings', 'categories'), { list: categories, updatedAt: new Date().toISOString() }, { merge: true });
+}
+
+export async function updateOrderDelivery(orderId: string, deliveryPartner: string, deliveryComments: string): Promise<void> {
+  const db = requireFirestore();
+  await updateDoc(doc(db, 'orders', orderId), {
+    deliveryPartner,
+    deliveryComments,
+    updatedAt: new Date().toISOString(),
+  });
+}
+
+// The assistant's learned insight weights are private to the host and developer.
+export function subscribeAiMemory(onChange: (weights: Record<string, number>) => void, onError: (error: Error) => void) {
+  const db = requireFirestore();
+  return onSnapshot(doc(db, 'hostPrivate', 'aiMemory'), snapshot => {
+    const raw = snapshot.exists() ? snapshot.data().weights : {};
+    const weights: Record<string, number> = {};
+    if (raw && typeof raw === 'object') {
+      Object.entries(raw as Record<string, unknown>).forEach(([key, value]) => {
+        if (typeof value === 'number' && Number.isFinite(value)) weights[key] = value;
+      });
+    }
+    onChange(weights);
+  }, onError);
+}
+
+export async function saveAiMemory(weights: Record<string, number>): Promise<void> {
+  const db = requireFirestore();
+  await setDoc(doc(db, 'hostPrivate', 'aiMemory'), { weights, updatedAt: new Date().toISOString() }, { merge: true });
 }
