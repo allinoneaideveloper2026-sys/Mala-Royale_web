@@ -41,8 +41,10 @@ export interface CustomerAddress {
   street2?: string;
   landmark1: string;
   landmark2?: string;
+  city?: string;
   taluk?: string;
   district?: string;
+  state?: string;
   street?: string;
   pincode: string;
   googleMapsPin?: string;
@@ -117,6 +119,10 @@ export interface Order {
   courierPayment?: PaymentRecord;
   deliveryPartner?: string;
   deliveryComments?: string;
+  rejectionReason?: string;
+  rejectionNote?: string;
+  hostMessage?: string;
+  hostMessageAt?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -130,5 +136,20 @@ export interface Enquiry {
   productId?: string;
   productName?: string;
   status: 'NEW' | 'REPLIED';
+  createdAt: string;
+}
+
+export type FeedbackSentiment = 'POSITIVE' | 'NEGATIVE' | 'SUGGESTION' | 'NEUTRAL';
+
+export interface Feedback {
+  id: string;
+  userId: string;
+  name?: string;
+  text: string;
+  sentiment: FeedbackSentiment;
+  category: string;
+  confidence: number;
+  language: string;
+  status: 'NEW' | 'REVIEWED';
   createdAt: string;
 }

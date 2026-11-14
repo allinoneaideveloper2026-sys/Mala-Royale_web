@@ -17,7 +17,7 @@ import {
 } from 'firebase/firestore';
 import { CONFIG } from '../config';
 import { firestore } from '../firebase';
-import { CourierBill, CustomerAddress, Enquiry, Order, ParcelDetails, PaymentRecord, PincodeCheck, Product, ProductMedia, ProductStatus, SavedDeliveryAddress } from './types';
+import { CourierBill, CustomerAddress, Enquiry, Feedback, FeedbackSentiment, Order, ParcelDetails, PaymentRecord, PincodeCheck, Product, ProductMedia, ProductStatus, SavedDeliveryAddress } from './types';
 
 function requireFirestore(): Firestore {
   if (!firestore) throw new Error('Firebase is not configured. Add the VITE_FIREBASE_* settings first.');
@@ -347,7 +347,7 @@ export async function submitCloudOrderForDispatch(orderId: string): Promise<void
   });
 }
 
-export async function markCloudOrderNotAccepted(orderId: string): Promise<void> {
+export async function markCloudOrderNotAccepted(orderId: string, reason = '', note = ''): Promise<void> {
   const db = requireFirestore();
   const orderRef = doc(db, 'orders', orderId);
   await runTransaction(db, async transaction => {
@@ -369,7 +369,12 @@ export async function markCloudOrderNotAccepted(orderId: string): Promise<void> 
       });
     }
 
-    transaction.update(orderRef, { stage: 'NOT_ACCEPTED', updatedAt: new Date().toISOString() });
+    transaction.update(orderRef, {
+      stage: 'NOT_ACCEPTED',
+      rejectionReason: reason,
+      rejectionNote: note,
+      updatedAt: new Date().toISOString(),
+    });
     restocks.forEach(update => transaction.update(update.ref, { quantity: update.quantity }));
   });
 }
@@ -584,4 +589,69 @@ export function subscribeAiMemory(onChange: (weights: Record<string, number>) =>
 export async function saveAiMemory(weights: Record<string, number>): Promise<void> {
   const db = requireFirestore();
   await setDoc(doc(db, 'hostPrivate', 'aiMemory'), { weights, updatedAt: new Date().toISOString() }, { merge: true });
+}
+
+// A short note from the host that the customer sees on their order.
+export async function saveOrderMessage(orderId: string, message: string): Promise<void> {
+  const db = requireFirestore();
+  const now = new Date().toISOString();
+  await updateDoc(doc(db, 'orders', orderId), { hostMessage: message, hostMessageAt: now, updatedAt: now });
+}
+
+// Optional WhatsApp number used only as a fallback when a customer cannot send an enquiry through the site.
+export function subscribeContactSettings(onChange: (whatsappNumber: string) => void, onError: (error: Error) => void) {
+  const db = requireFirestore();
+  return onSnapshot(doc(db, 'settings', 'contact'), snapshot => {
+    onChange(snapshot.exists() ? String(snapshot.data().whatsappNumber || '') : '');
+  }, onError);
+}
+
+export async function saveContactSettings(whatsappNumber: string): Promise<void> {
+  const db = requireFirestore();
+  await setDoc(doc(db, 'settings', 'contact'), { whatsappNumber, updatedAt: new Date().toISOString() }, { merge: true });
+}
+
+export interface FeedbackInput {
+  name?: string;
+  text: string;
+  sentiment: FeedbackSentiment;
+  category: string;
+  confidence: number;
+  language: string;
+}
+
+export async function submitFeedback(userId: string, input: FeedbackInput): Promise<void> {
+  const db = requireFirestore();
+  const text = input.text.trim();
+  if (!text || text.length > 200) throw new Error('Enter your feedback (up to 200 characters).');
+  const name = (input.name || '').trim().slice(0, 80);
+  const data: Omit<Feedback, 'id'> = {
+    userId,
+    text,
+    sentiment: input.sentiment,
+    category: input.category.slice(0, 40),
+    confidence: Math.max(0, Math.min(1, input.confidence)),
+    language: input.language.slice(0, 8),
+    status: 'NEW',
+    createdAt: new Date().toISOString(),
+    ...(name ? { name } : {}),
+  };
+  await setDoc(doc(db, 'feedback', `FB-${createId()}`), data);
+}
+
+export function subscribeFeedback(onChange: (items: Feedback[]) => void, onError: (error: Error) => void) {
+  const db = requireFirestore();
+  return onSnapshot(collection(db, 'feedback'), snapshot => {
+    onChange(snapshot.docs.map(item => ({ ...item.data(), id: item.id } as Feedback)));
+  }, onError);
+}
+
+export async function setFeedbackStatus(feedbackId: string, status: 'NEW' | 'REVIEWED'): Promise<void> {
+  const db = requireFirestore();
+  await updateDoc(doc(db, 'feedback', feedbackId), { status });
+}
+
+export async function deleteFeedback(feedbackId: string): Promise<void> {
+  const db = requireFirestore();
+  await deleteDoc(doc(db, 'feedback', feedbackId));
 }

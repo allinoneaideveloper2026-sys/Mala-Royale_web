@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import type { Product } from '../../domain/types';
 import { buildOffers, type BrowsingContext, type OfferAction } from './offerEngine';
 import { cacheImage, optimizeImageUrl, useCachedImage } from './imageCache';
+import { useTr } from '../../lang/ui';
 import './AIOfferBanner.css';
 
 export interface AIOfferBannerContainerProps {
@@ -35,9 +36,10 @@ export default function AIOfferBannerContainer({
   onDismiss,
   rotateMs = 7000,
 }: AIOfferBannerContainerProps) {
+  const tr = useTr();
   const offers = useMemo(
-    () => buildOffers({ products, context, activeCategory, cartCount, now: Date.now() }),
-    [products, context, activeCategory, cartCount],
+    () => buildOffers({ products, context, activeCategory, cartCount, now: Date.now(), tr }),
+    [products, context, activeCategory, cartCount, tr],
   );
   const [index, setIndex] = useState(0);
   const [leaving, setLeaving] = useState(false);
@@ -107,7 +109,7 @@ export default function AIOfferBannerContainer({
   };
 
   return (
-    <section className="mr-offer-slot" aria-label="Offers and updates">
+    <section className="mr-offer-slot" aria-label={tr('Offers and updates')}>
       <div
         key={current.id}
         className={`mr-offer mr-accent-${current.accent} ${leaving ? 'mr-offer-out' : 'mr-offer-in'}`}
@@ -144,7 +146,7 @@ export default function AIOfferBannerContainer({
           {current.cta.label}<span aria-hidden="true"> →</span>
         </button>
 
-        <button type="button" className="mr-offer-close" aria-label="Dismiss this offer" onClick={dismiss}>✕</button>
+        <button type="button" className="mr-offer-close" aria-label={tr('Dismiss this offer')} onClick={dismiss}>✕</button>
 
         {count > 1 && (
           <div className="mr-offer-dots">
@@ -153,7 +155,7 @@ export default function AIOfferBannerContainer({
                 key={offer.id}
                 type="button"
                 className={`mr-offer-dot${dotIndex === safeIndex ? ' is-active' : ''}`}
-                aria-label={`Show offer ${dotIndex + 1} of ${count}`}
+                aria-label={tr('Show offer {index} of {total}', { index: dotIndex + 1, total: count })}
                 onClick={() => goTo(dotIndex)}
               />
             ))}

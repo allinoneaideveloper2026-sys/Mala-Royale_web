@@ -91,6 +91,26 @@ service cloud.firestore {
       allow read, write: if isStaff();
     }
 
+    // Customer feedback from the About page. Only staff can read or manage it.
+    match /feedback/{feedbackId} {
+      allow create: if hasSession()
+        && request.resource.data.keys().hasOnly(['userId', 'name', 'text', 'sentiment', 'category', 'confidence', 'language', 'status', 'createdAt'])
+        && request.resource.data.keys().hasAll(['userId', 'text', 'sentiment', 'category', 'confidence', 'language', 'status', 'createdAt'])
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.status == 'NEW'
+        && request.resource.data.text is string
+        && request.resource.data.text.size() > 0
+        && request.resource.data.text.size() <= 200
+        && request.resource.data.sentiment in ['POSITIVE', 'NEGATIVE', 'SUGGESTION', 'NEUTRAL']
+        && request.resource.data.category is string
+        && request.resource.data.category.size() <= 40
+        && request.resource.data.confidence is number
+        && request.resource.data.language is string
+        && request.resource.data.createdAt is string
+        && (!('name' in request.resource.data) || request.resource.data.name.size() <= 80);
+      allow read, update, delete: if isStaff();
+    }
+
     match /hostAccess/{email} {
       allow get: if isStaff() || (signedIn() && request.auth.token.email == email);
       allow list: if isDeveloper();

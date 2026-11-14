@@ -1,8 +1,8 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { GoogleAuthProvider, linkWithPopup, onAuthStateChanged, signInAnonymously, signInWithCredential, signInWithPopup, signOut, type User } from 'firebase/auth';
 import { CONFIG } from './config';
-import { TRANSLATIONS, Language } from './i18n';
-import { UserRole, Product, ProductMedia, ProductStatus, Enquiry, Order, CourierBill, CustomerAddress, ParcelDetails, ParcelParty, PincodeCheck, SavedDeliveryAddress } from './domain/types';
+import { LANGUAGES, LANGUAGE_STORAGE_KEY, TrContext, buildStrings, isUiLanguage, makeTr, useTr, type UiLanguage } from './lang/ui';
+import { UserRole, Product, ProductMedia, ProductStatus, Enquiry, Feedback, Order, CourierBill, CustomerAddress, ParcelDetails, ParcelParty, PincodeCheck, SavedDeliveryAddress } from './domain/types';
 import { globalOrderBook } from './domain/OrderBook';
 import { auth, firebaseConfigured } from './firebase';
 import AIOfferBannerContainer from './components/AIOfferBanner/AIOfferBannerContainer';
@@ -12,6 +12,13 @@ import { useBrowsingContext } from './components/AIOfferBanner/useBrowsingContex
 import HostAnalytics from './components/host/HostAnalytics';
 import MasterLedger from './components/host/MasterLedger';
 import { adjustWeight } from './analytics/insights';
+import { analyzeFeedback } from './analytics/feedback';
+import './components/storefront/Storefront.css';
+import AboutSection, { type FeedbackResult } from './components/storefront/AboutSection';
+import ShareMenu from './components/storefront/ShareMenu';
+import { HowItWorks, OrderTimeline, StoryShowcase, ValueStrip } from './components/storefront/StorefrontSections';
+import FeedbackPanel from './components/host/FeedbackPanel';
+import HostOrderActions from './components/host/HostOrderActions';
 import { productCreatedMs } from './analytics/orderMetrics';
 import {
   attachCloudCourierBill,
@@ -21,6 +28,7 @@ import {
   confirmCloudOrderDelivery,
   deleteCloudDeliveryAddress,
   deleteEnquiry,
+  deleteFeedback,
   deleteProduct,
   isAuthorizedHost,
   isConfiguredDeveloper,
@@ -33,10 +41,15 @@ import {
   saveAiMemory,
   saveCategories,
   saveCloudParcelDetails,
+  saveContactSettings,
+  saveOrderMessage,
   setEnquiryStatus,
+  setFeedbackStatus,
   subscribeAiMemory,
   subscribeAuthorizedHosts,
   subscribeCategories,
+  subscribeContactSettings,
+  subscribeFeedback,
   subscribeCheckoutQr,
   subscribeEnquiries,
   subscribeSavedAddresses,
@@ -45,6 +58,7 @@ import {
   submitCloudOrderForDispatch,
   submitCloudCourierPayment,
   submitEnquiry,
+  submitFeedback,
   updateOrderDelivery,
   updateProduct,
   uploadCheckoutQr,
@@ -87,7 +101,7 @@ const MAX_VIDEO_SECONDS = 30;
 const LOGO_URL = 'https://res.cloudinary.com/yydehgmd/image/upload/w_400,q_auto,f_auto/v1793990131/MalaRoyale.jpg';
 
 type HostOrderTab = 'ACTIVE' | 'DISPATCHED' | 'HISTORY';
-type HostTab = 'ORDERS' | 'LEDGER' | 'UPLOAD' | 'CATALOG' | 'QR' | 'ENQUIRIES' | 'INSIGHTS';
+type HostTab = 'ORDERS' | 'LEDGER' | 'UPLOAD' | 'CATALOG' | 'QR' | 'ENQUIRIES' | 'FEEDBACK' | 'INSIGHTS';
 type SortKey = 'featured' | 'newest' | 'price-asc' | 'price-desc' | 'discount' | 'in-stock';
 
 const DEFAULT_CATEGORIES = ['Sarees', 'Custom Kuchu'];
@@ -398,6 +412,7 @@ function CourierPaymentForm({
   canSubmit: boolean;
   onSubmit: (orderId: string, utr: string) => Promise<void>;
 }) {
+  const tr = useTr();
   const [utr, setUtr] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
@@ -420,23 +435,23 @@ function CourierPaymentForm({
 
   return (
     <div style={{ marginTop: '0.7rem', padding: '0.8rem', backgroundColor: '#f7f2ef', borderRadius: '6px' }}>
-      <p style={{ margin: '0 0 0.35rem' }}>Courier charge: <strong>₹{order.courierBill.amount}</strong></p>
-      {paymentQrUrl && <img src={paymentQrUrl} alt="Courier payment QR" style={{ width: '150px', height: '150px', objectFit: 'contain', display: 'block', margin: '0.6rem 0' }} />}
+      <p style={{ margin: '0 0 0.35rem' }}>{tr('Courier charge:')} <strong>₹{order.courierBill.amount}</strong></p>
+      {paymentQrUrl && <img src={paymentQrUrl} alt={tr('Courier payment QR')} style={{ width: '150px', height: '150px', objectFit: 'contain', display: 'block', margin: '0.6rem 0' }} />}
       {order.courierPayment ? (
         <p role="status" style={{ marginBottom: 0, color: order.courierPayment.verified ? '#1b5e20' : '#8a4b08' }}>
-          {order.courierPayment.verified ? 'Courier payment confirmed by host.' : 'Courier payment submitted; waiting for host confirmation.'}
-          {' '}UTR: {order.courierPayment.utr}
+          {order.courierPayment.verified ? tr('Courier payment confirmed by host.') : tr('Courier payment submitted; waiting for host confirmation.')}
+          {' '}{tr('UTR:')} {order.courierPayment.utr}
         </p>
       ) : !canSubmit ? (
-        <p role="status" style={{ marginBottom: 0 }}>Sign in to submit this courier payment.</p>
+        <p role="status" style={{ marginBottom: 0 }}>{tr('Sign in to submit this courier payment.')}</p>
       ) : (
         <form onSubmit={submit} style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', marginTop: '0.6rem' }}>
           <label style={{ flex: '1 1 190px' }}>
-            Courier payment UTR
-            <input value={utr} onChange={event => setUtr(event.target.value)} required inputMode="numeric" pattern="[0-9]{12}" maxLength={12} title="Enter the 12-digit UTR" style={{ display: 'block', boxSizing: 'border-box', width: '100%', padding: '0.55rem' }} />
+            {tr('Courier payment UTR')}
+            <input value={utr} onChange={event => setUtr(event.target.value)} required inputMode="numeric" pattern="[0-9]{12}" maxLength={12} title={tr('Enter the 12-digit UTR')} style={{ display: 'block', boxSizing: 'border-box', width: '100%', padding: '0.55rem' }} />
           </label>
           <button type="submit" disabled={submitting} style={{ alignSelf: 'end', backgroundColor: '#6e1a3a', color: '#fff', border: 0, borderRadius: '4px', padding: '0.6rem 0.8rem', cursor: 'pointer', fontWeight: 'bold' }}>
-            {submitting ? 'Submitting...' : `Submit ₹${order.courierBill.amount} payment`}
+            {submitting ? tr('Submitting...') : `Submit ₹${order.courierBill.amount} payment`}
           </button>
           {error && <span role="alert" style={{ flexBasis: '100%', color: '#b00020' }}>{error}</span>}
         </form>
@@ -456,22 +471,24 @@ function DeliveryAddressFields({
   isCheckingPincode: boolean;
   onCheckPincode: () => void;
 }) {
+  const tr = useTr();
   const fields: Array<{ key: keyof CustomerAddress; label: string; required?: boolean; numeric?: boolean }> = [
-    { key: 'fullName', label: 'Customer name', required: true },
-    { key: 'phone', label: 'WhatsApp / phone number', required: true, numeric: true },
-    { key: 'houseNameOrNumber', label: 'House name / number' },
-    { key: 'street1', label: 'Street 1', required: true },
-    { key: 'street2', label: 'Street 2', required: true },
-    { key: 'landmark1', label: 'Landmark 1', required: true },
-    { key: 'landmark2', label: 'Landmark 2' },
-    { key: 'taluk', label: 'Taluk', required: true },
-    { key: 'district', label: 'District', required: true },
-    { key: 'pincode', label: 'Pincode', required: true, numeric: true },
+    { key: 'fullName', label: tr('Customer name'), required: true },
+    { key: 'phone', label: tr('WhatsApp / phone number'), required: true, numeric: true },
+    { key: 'houseNameOrNumber', label: tr('House name / number') },
+    { key: 'street1', label: tr('Address line 1 (primary address details)'), required: true },
+    { key: 'street2', label: tr('Address line 2 (apartment, suite or other details) [optional]') },
+    { key: 'landmark1', label: tr('Landmark 1'), required: true },
+    { key: 'landmark2', label: tr('Landmark 2') },
+    { key: 'city', label: tr('City'), required: true },
+    { key: 'taluk', label: tr('Taluk [optional]') },
+    { key: 'district', label: tr('District'), required: true },
+    { key: 'pincode', label: tr('Pincode'), required: true, numeric: true },
   ];
 
   return (
     <>
-      <p style={{ margin: 0, color: '#666', fontSize: '0.85rem' }}>Address details are collected only to deliver this order. The host will use your WhatsApp number to confirm your order and share delivery updates.</p>
+      <p style={{ margin: 0, color: '#666', fontSize: '0.85rem' }}>{tr('Address details are collected only to deliver this order. The host will use your WhatsApp number to confirm your order and share delivery updates.')}</p>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))', gap: '0.6rem' }}>
         {fields.map(field => (
           <label key={field.key} style={{ display: 'grid', gap: '0.2rem', fontSize: '0.85rem' }}>
@@ -493,7 +510,7 @@ function DeliveryAddressFields({
       </div>
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.6rem', alignItems: 'center' }}>
         <button type="button" disabled={isCheckingPincode || address.pincode.length !== 6} onClick={onCheckPincode} style={{ padding: '0.55rem 0.8rem' }}>
-          {isCheckingPincode ? 'Checking pincode...' : 'Check pincode online'}
+          {isCheckingPincode ? tr('Checking pincode...') : tr('Check pincode online')}
         </button>
         {address.pincodeCheck && (
           <span role="status" style={{ color: address.pincodeCheck.status === 'NOT_FOUND' || address.pincodeCheck.status === 'NOT_SERVICEABLE' ? '#b00020' : '#555', fontSize: '0.85rem' }}>
@@ -509,10 +526,10 @@ function customerParcelParty(address: CustomerAddress): ParcelParty {
   return {
     fullName: address.fullName,
     phone: address.phone,
-    addressLine1: [address.houseNameOrNumber, address.street1, address.street2, address.street].filter(Boolean).join(', '),
-    addressLine2: [address.landmark1, address.landmark2].filter(Boolean).join(', '),
-    city: address.taluk || '',
-    state: address.district || '',
+    addressLine1: [address.houseNameOrNumber, address.street1].filter(Boolean).join(', ') || address.street || '',
+    addressLine2: [address.street2, address.landmark1, address.landmark2].filter(Boolean).join(', '),
+    city: address.city || address.taluk || '',
+    state: address.state || address.district || '',
     pincode: address.pincode,
     country: 'India',
   };
@@ -549,12 +566,12 @@ function ParcelSheet({
 
   const save = async (event: React.FormEvent) => {
     event.preventDefault();
-    if (!from.fullName.trim() || !from.phone.trim() || !from.addressLine1.trim() || !from.pincode.trim()) {
-      setError('Complete the From name, phone, address, and pincode.');
+    if (!from.fullName.trim() || !from.phone.trim() || !from.addressLine1.trim() || !from.city.trim() || !from.pincode.trim()) {
+      setError('Complete the From name, phone, address line 1, city and pincode.');
       return;
     }
-    if (!to.fullName.trim() || !to.phone.trim() || !to.addressLine1.trim() || !to.pincode.trim()) {
-      setError('Complete the To name, phone, address, and pincode.');
+    if (!to.fullName.trim() || !to.phone.trim() || !to.addressLine1.trim() || !to.city.trim() || !to.pincode.trim()) {
+      setError('Complete the To name, phone, address line 1, city and pincode.');
       return;
     }
     setSaving(true);
@@ -630,8 +647,8 @@ function ParcelSheet({
   const partyFields: Array<[keyof ParcelParty, string]> = [
     ['fullName', 'Name'],
     ['phone', 'Phone'],
-    ['addressLine1', 'Address line 1'],
-    ['addressLine2', 'Address line 2 / landmark'],
+    ['addressLine1', 'Address line 1 (primary address details)'],
+    ['addressLine2', 'Address line 2 (apartment, suite, landmark) [optional]'],
     ['city', 'City'],
     ['state', 'State'],
     ['pincode', 'Pincode'],
@@ -649,7 +666,7 @@ function ParcelSheet({
               {partyFields.map(([field, label]) => (
                 <label key={field} style={{ display: 'grid', gap: '0.2rem', fontSize: '0.85rem' }}>
                   {label}
-                  <input value={side === 'from' ? from[field] : to[field]} onChange={event => updateParty(side, field, event.target.value)} required={['fullName', 'phone', 'addressLine1', 'pincode'].includes(field)} />
+                  <input value={side === 'from' ? from[field] : to[field]} onChange={event => updateParty(side, field, event.target.value)} required={['fullName', 'phone', 'addressLine1', 'city', 'pincode'].includes(field)} />
                 </label>
               ))}
             </fieldset>
@@ -719,6 +736,7 @@ function MediaLightbox({
   name: string;
   onClose: () => void;
 }) {
+  const tr = useTr();
   const [index, setIndex] = useState(startIndex);
   const current = items[Math.min(index, items.length - 1)];
   const go = (delta: number) => setIndex(value => (value + delta + items.length) % items.length);
@@ -758,9 +776,9 @@ function MediaLightbox({
       onClick={onClose}
       style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.92)', zIndex: 1300, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem', padding: '1rem' }}
     >
-      <button type="button" aria-label="Close" onClick={onClose} style={{ position: 'absolute', top: '10px', right: '16px', background: 'none', border: 'none', color: '#fff', fontSize: '2rem', cursor: 'pointer' }}>✕</button>
+      <button type="button" aria-label={tr('Close')} onClick={onClose} style={{ position: 'absolute', top: '10px', right: '16px', background: 'none', border: 'none', color: '#fff', fontSize: '2rem', cursor: 'pointer' }}>✕</button>
       {items.length > 1 && (
-        <button type="button" aria-label="Previous" onClick={event => { event.stopPropagation(); go(-1); }} style={arrowStyle}>‹</button>
+        <button type="button" aria-label={tr('Previous')} onClick={event => { event.stopPropagation(); go(-1); }} style={arrowStyle}>‹</button>
       )}
       <div onClick={event => event.stopPropagation()} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '0.6rem', minWidth: 0 }}>
         {current.type === 'video' ? (
@@ -771,13 +789,14 @@ function MediaLightbox({
         <span style={{ color: '#fff', fontSize: '0.85rem' }}>{name}{items.length > 1 ? ` · ${index + 1} / ${items.length}` : ''}</span>
       </div>
       {items.length > 1 && (
-        <button type="button" aria-label="Next" onClick={event => { event.stopPropagation(); go(1); }} style={arrowStyle}>›</button>
+        <button type="button" aria-label={tr('Next')} onClick={event => { event.stopPropagation(); go(1); }} style={arrowStyle}>›</button>
       )}
     </div>
   );
 }
 
 function ProductGallery({ product, badges = [], onView }: { product: Product; badges?: string[]; onView?: () => void }) {
+  const tr = useTr();
   const media: ProductMedia[] = product.media?.length
     ? product.media
     : [{ url: product.image, type: 'image' }];
@@ -805,7 +824,7 @@ function ProductGallery({ product, badges = [], onView }: { product: Product; ba
           onClick={event => { event.stopPropagation(); openViewer(); }}
           style={{ position: 'absolute', top: '8px', right: '8px', backgroundColor: 'rgba(0,0,0,0.6)', color: '#fff', border: 'none', borderRadius: '999px', padding: '0.3rem 0.7rem', fontSize: '0.75rem', cursor: 'pointer' }}
         >
-          ⤢ View full
+          {tr('⤢ View full')}
         </button>
         {badges.length > 0 && (
           <div style={{ position: 'absolute', top: '8px', left: '8px', display: 'flex', flexDirection: 'column', gap: '4px', pointerEvents: 'none' }}>
@@ -842,7 +861,14 @@ function ProductGallery({ product, badges = [], onView }: { product: Product; ba
 
 export default function App() {
   // Navigation & Authentication State
-  const [lang, setLang] = useState<Language>('en');
+  const [lang, setLang] = useState<UiLanguage>(() => {
+    try {
+      const stored = window.localStorage.getItem(LANGUAGE_STORAGE_KEY);
+      return isUiLanguage(stored) ? stored : 'en';
+    } catch {
+      return 'en';
+    }
+  });
   const [role, setRole] = useState<UserRole>('CUSTOMER');
   const [userEmail, setUserEmail] = useState('customer@gmail.com');
   const [firebaseUser, setFirebaseUser] = useState<User | null>(null);
@@ -876,6 +902,14 @@ export default function App() {
   const [isCartOpen, setIsCartOpen] = useState(false);
   const [placedOrder, setPlacedOrder] = useState<{ orderId: string; total: number; phone: string; name: string } | null>(null);
   const [orderCopied, setOrderCopied] = useState(false);
+  const [expandedOrders, setExpandedOrders] = useState<Record<string, boolean>>({});
+  const [feedbackItems, setFeedbackItems] = useState<Feedback[]>([]);
+  const [shareTarget, setShareTarget] = useState<Product | null>(null);
+  const [enquiryNeedsSignIn, setEnquiryNeedsSignIn] = useState(false);
+  const [hostWhatsApp, setHostWhatsApp] = useState('');
+  const [whatsAppDraft, setWhatsAppDraft] = useState('');
+  const [highlightedProductId, setHighlightedProductId] = useState('');
+  const hashHandled = useRef(false);
   const [enquiries, setEnquiries] = useState<Enquiry[]>([]);
   const [isEnquiryOpen, setIsEnquiryOpen] = useState(false);
   const [enquiryName, setEnquiryName] = useState('');
@@ -894,7 +928,7 @@ export default function App() {
   const [isCheckoutOpen, setIsCheckoutOpen] = useState(false);
   const [activeOrders, setActiveOrders] = useState<Order[]>([]);
   const [hostOrderTab, setHostOrderTab] = useState<HostOrderTab>('ACTIVE');
-  const [customerTab, setCustomerTab] = useState<'SHOP' | 'ORDERS' | 'ADDRESSES'>('SHOP');
+  const [customerTab, setCustomerTab] = useState<'SHOP' | 'ORDERS' | 'ADDRESSES' | 'ABOUT'>('SHOP');
   const [savedAddresses, setSavedAddresses] = useState<SavedDeliveryAddress[]>([]);
   const [selectedAddressId, setSelectedAddressId] = useState('');
   const [useSavedAddress, setUseSavedAddress] = useState(false);
@@ -920,7 +954,17 @@ export default function App() {
   });
   const [utr, setUtr] = useState('');
 
-  const t = TRANSLATIONS[lang];
+  const t = buildStrings(lang);
+  const tr = useMemo(() => makeTr(lang), [lang]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(LANGUAGE_STORAGE_KEY, lang);
+    } catch {
+      /* the choice then lasts for this visit only */
+    }
+    document.documentElement.lang = lang;
+  }, [lang]);
   const isStaff = role === 'OWNER' || role === 'DEVELOPER';
   const googleUser = firebaseUser && !firebaseUser.isAnonymous ? firebaseUser : null;
   const [logoFailed, setLogoFailed] = useState(false);
@@ -1020,6 +1064,33 @@ export default function App() {
     if (!firebaseConfigured) return;
     return subscribeCategories(setCustomCategories, error => setSyncError(error.message));
   }, []);
+
+  useEffect(() => {
+    if (!firebaseConfigured) return;
+    return subscribeContactSettings(number => {
+      setHostWhatsApp(number);
+      setWhatsAppDraft(number);
+    }, () => undefined);
+  }, []);
+
+  useEffect(() => {
+    if (!firebaseConfigured || !isStaff) return;
+    return subscribeFeedback(setFeedbackItems, error => setSyncError(error.message));
+  }, [isStaff]);
+
+  // A shared link like ...#product=p-123 scrolls to that piece and highlights it.
+  useEffect(() => {
+    if (hashHandled.current || products.length === 0) return;
+    const match = /#product=([^&]+)/.exec(window.location.hash);
+    if (!match) {
+      hashHandled.current = true;
+      return;
+    }
+    const id = decodeURIComponent(match[1]);
+    if (!products.some(product => product.id === id)) return;
+    hashHandled.current = true;
+    window.setTimeout(() => focusProduct(id), 600);
+  }, [products]);
 
   useEffect(() => {
     if (!firebaseConfigured || !isStaff) return;
@@ -1307,6 +1378,7 @@ export default function App() {
     setEnquiryProduct(product ? { id: product.id, name: product.name } : null);
     setEnquiryMessage(product ? `I'm interested in "${product.name}" (₹${unitPrice(product)}). Is it available?` : '');
     setEnquiryError('');
+    setEnquiryNeedsSignIn(false);
     setEnquirySent(false);
     setIsEnquiryOpen(true);
   };
@@ -1317,27 +1389,38 @@ export default function App() {
     const phone = enquiryPhone.replace(/\D/g, '');
     const message = enquiryMessage.trim();
     if (!name) {
-      setEnquiryError('Please enter your name.');
+      setEnquiryError(tr('Please enter your name.'));
       return;
     }
     if (phone.length < 10 || phone.length > 15) {
-      setEnquiryError('Enter your 10-digit WhatsApp number so we can reply.');
+      setEnquiryError(tr('Enter your 10-digit WhatsApp number so we can reply.'));
       return;
     }
     if (!message) {
-      setEnquiryError('Please type your question.');
+      setEnquiryError(tr('Please type your question.'));
       return;
     }
     if (Date.now() - lastEnquiryAt < 20000) {
-      setEnquiryError('Please wait a few seconds before sending another enquiry.');
+      setEnquiryError(tr('Please wait a few seconds before sending another enquiry.'));
       return;
     }
     setEnquirySending(true);
     setEnquiryError('');
+    setEnquiryNeedsSignIn(false);
     try {
       const enquiryInput = { name, phone, message, productId: enquiryProduct?.id, productName: enquiryProduct?.name };
       if (firebaseConfigured) {
-        const uid = firebaseUser?.uid || await ensureCustomerSession();
+        let uid = firebaseUser?.uid || '';
+        if (!uid) {
+          try {
+            uid = await ensureCustomerSession();
+          } catch (sessionError) {
+            console.error('Enquiry session failed:', sessionError);
+            setEnquiryNeedsSignIn(true);
+            setEnquiryError(tr('A quick sign-in is needed to send your message. Please sign in with Google, then press Send again.'));
+            return;
+          }
+        }
         await withTimeout(submitEnquiry(uid, enquiryInput), 30000, 'Sending is taking too long. Check your internet connection and try again.');
       } else {
         setEnquiries(current => [{ ...enquiryInput, id: `ENQ-${Date.now()}`, userId: 'local', status: 'NEW', createdAt: new Date().toISOString() }, ...current]);
@@ -1347,7 +1430,8 @@ export default function App() {
       setEnquiryMessage('');
     } catch (error) {
       console.error('Enquiry failed:', error);
-      setEnquiryError('We could not send your enquiry right now. Please try again in a moment.');
+      setEnquiryNeedsSignIn(!googleUser);
+      setEnquiryError(googleUser ? tr('We could not send your enquiry right now. Please try again in a moment.') : tr('We could not send your message. Please sign in with Google and try again.'));
     } finally {
       setEnquirySending(false);
     }
@@ -1378,11 +1462,7 @@ export default function App() {
     }
   };
 
-  const shareProduct = (product: Product) => {
-    const link = `${window.location.origin}${window.location.pathname}`;
-    const text = `Look at this at Mala Royale: ${product.name} (₹${unitPrice(product)}) ${link}`;
-    window.open(`https://wa.me/?text=${encodeURIComponent(text)}`, '_blank', 'noopener,noreferrer');
-  };
+  const shareProduct = (product: Product) => setShareTarget(product);
 
   // Host: categories, delivery details, assistant feedback
   const handleAddCategory = async () => {
@@ -1467,6 +1547,125 @@ export default function App() {
     window.setTimeout(() => document.getElementById('mr-catalog')?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 60);
   };
 
+  const focusProduct = (productId: string) => {
+    setCustomerTab('SHOP');
+    setCategoryFilter('All');
+    setOnlyOffers(false);
+    setOnlyInStock(false);
+    window.setTimeout(() => {
+      document.getElementById(`product-${productId}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      setHighlightedProductId(productId);
+      window.setTimeout(() => setHighlightedProductId(''), 3600);
+    }, 120);
+  };
+
+  const toggleOrder = (orderId: string) => setExpandedOrders(current => ({ ...current, [orderId]: !current[orderId] }));
+
+  const handleRejectOrder = async (orderId: string, reason: string, note: string) => {
+    try {
+      if (firebaseConfigured) {
+        await withTimeout(markCloudOrderNotAccepted(orderId, reason, note), 30000, 'Rejecting the order is taking too long. Check your internet connection and try again.');
+      } else {
+        globalOrderBook.markNotAccepted(orderId);
+        setActiveOrders([...globalOrderBook.getAllOrders()].map(order => order.orderId === orderId ? { ...order, rejectionReason: reason, rejectionNote: note } : order));
+      }
+    } catch (error) {
+      setSyncError(error instanceof Error ? error.message : 'Could not reject the order.');
+      throw error;
+    }
+  };
+
+  const handleSaveOrderMessage = async (orderId: string, message: string) => {
+    try {
+      if (firebaseConfigured) {
+        await withTimeout(saveOrderMessage(orderId, message), 30000, 'Saving the message is taking too long. Check your internet connection and try again.');
+      } else {
+        setActiveOrders(current => current.map(order => order.orderId === orderId ? { ...order, hostMessage: message, hostMessageAt: new Date().toISOString() } : order));
+      }
+    } catch (error) {
+      setSyncError(error instanceof Error ? error.message : 'Could not save the message.');
+      throw error;
+    }
+  };
+
+  const handleSaveWhatsApp = async (digitsInput: string) => {
+    const digits = digitsInput.replace(/\D/g, '');
+    if (digits && digits.length < 10) {
+      alert('Enter a valid WhatsApp number (10 digits, or with the country code).');
+      return;
+    }
+    try {
+      if (firebaseConfigured) {
+        await withTimeout(saveContactSettings(digits), 30000, 'Saving the number is taking too long. Check your internet connection and try again.');
+      } else {
+        setHostWhatsApp(digits);
+      }
+      setWhatsAppDraft(digits);
+    } catch (error) {
+      setSyncError(error instanceof Error ? error.message : 'Could not save the WhatsApp number.');
+    }
+  };
+
+  const handleFeedbackStatus = async (item: Feedback, status: 'NEW' | 'REVIEWED') => {
+    try {
+      if (firebaseConfigured) {
+        await withTimeout(setFeedbackStatus(item.id, status), 30000, 'Updating is taking too long. Check your internet connection and try again.');
+      } else {
+        setFeedbackItems(current => current.map(entry => entry.id === item.id ? { ...entry, status } : entry));
+      }
+    } catch (error) {
+      setSyncError(error instanceof Error ? error.message : 'Could not update the feedback.');
+    }
+  };
+
+  const handleDeleteFeedback = async (item: Feedback) => {
+    if (!confirmHostAction('Delete this feedback?')) return;
+    try {
+      if (firebaseConfigured) {
+        await withTimeout(deleteFeedback(item.id), 30000, 'Deleting is taking too long. Check your internet connection and try again.');
+      } else {
+        setFeedbackItems(current => current.filter(entry => entry.id !== item.id));
+      }
+    } catch (error) {
+      setSyncError(error instanceof Error ? error.message : 'Could not delete the feedback.');
+    }
+  };
+
+  // Customer: short feedback. It is analysed on the spot and filed for the host.
+  const handleSubmitFeedback = async (input: { name: string; text: string }): Promise<FeedbackResult> => {
+    const analysis = analyzeFeedback(input.text);
+    try {
+      if (firebaseConfigured) {
+        let uid = firebaseUser?.uid || '';
+        if (!uid) {
+          try {
+            uid = await ensureCustomerSession();
+          } catch (sessionError) {
+            console.error('Feedback session failed:', sessionError);
+            return { status: 'needs-signin' };
+          }
+        }
+        await withTimeout(submitFeedback(uid, {
+          name: input.name,
+          text: input.text,
+          sentiment: analysis.sentiment,
+          category: analysis.category,
+          confidence: analysis.confidence,
+          language: analysis.language,
+        }), 30000, 'Sending is taking too long. Check your internet connection and try again.');
+      } else {
+        setFeedbackItems(current => [{
+          id: `FB-${Date.now()}`, userId: 'local', name: input.name || undefined, text: input.text, sentiment: analysis.sentiment,
+          category: analysis.category, confidence: analysis.confidence, language: analysis.language, status: 'NEW', createdAt: new Date().toISOString(),
+        }, ...current]);
+      }
+      return { status: 'sent', sentiment: analysis.sentiment, category: analysis.category };
+    } catch (error) {
+      console.error('Feedback failed:', error);
+      return googleUser ? { status: 'error' } : { status: 'needs-signin' };
+    }
+  };
+
   // Cart Management
   const addToCart = (product: Product) => isPurchasable(product) && setCart(current => (
     current.some(line => line.product.id === product.id)
@@ -1494,23 +1693,23 @@ export default function App() {
   // Customer Action: Submit Order via OrderBook Engine
   const handlePlaceOrder = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!address.fullName.trim() || !address.phone.trim() || !address.street1?.trim() || !address.street2?.trim() || !address.landmark1.trim() || !address.taluk?.trim() || !address.district?.trim() || !/^\d{6}$/.test(address.pincode)) {
-      alert('Complete the required delivery-address fields before placing your order.');
+    if (!address.fullName.trim() || !address.phone.trim() || !address.street1?.trim() || !address.city?.trim() || !address.landmark1.trim() || !address.district?.trim() || !/^\d{6}$/.test(address.pincode)) {
+      alert(tr('Complete the required delivery-address fields before placing your order.'));
       setCheckoutStep(1);
       return;
     }
     if (!address.pincodeCheck) {
-      alert('Check the pincode online before placing your order.');
+      alert(tr('Check the pincode online before placing your order.'));
       setCheckoutStep(1);
       return;
     }
     if (['NOT_FOUND', 'NOT_SERVICEABLE'].includes(address.pincodeCheck.status)) {
-      alert('This pincode could not be confirmed as deliverable. Please check the address or contact the host.');
+      alert(tr('This pincode could not be confirmed as deliverable. Please check the address or contact the host.'));
       setCheckoutStep(1);
       return;
     }
     if (cart.length === 0) {
-      alert('Your cart is empty. Add at least one item before placing an order.');
+      alert(tr('Your cart is empty. Add at least one item before placing an order.'));
       setIsCheckoutOpen(false);
       return;
     }
@@ -1519,7 +1718,7 @@ export default function App() {
       return;
     }
     if (unavailableLines.length > 0) {
-      alert('Some items in your cart are no longer available. Please remove them and try again.');
+      alert(tr('Some items in your cart are no longer available. Please remove them and try again.'));
       setIsCheckoutOpen(false);
       setIsCartOpen(true);
       return;
@@ -1531,7 +1730,7 @@ export default function App() {
           customerUid = await ensureCustomerSession();
         } catch (sessionError) {
           console.error('Guest checkout session failed:', sessionError);
-          alert('We could not start a secure checkout. Please use the "Sign in with Google" button in this step and try again.');
+          alert(tr('We could not start a secure checkout. Please use the "Sign in with Google" button in this step and try again.'));
           return;
         }
       }
@@ -1585,6 +1784,7 @@ export default function App() {
       setCheckoutStep(1);
       setCustomerTab('ORDERS');
       setOrderCopied(false);
+      setExpandedOrders({ [order.orderId]: true });
       setPlacedOrder({ orderId: order.orderId, total: cartTotal, phone: deliveryAddress.phone, name: deliveryAddress.fullName });
     } catch (err: any) {
       const message = err instanceof Error && err.message.includes('permission-denied')
@@ -1732,6 +1932,7 @@ export default function App() {
         ...previous,
         district: result.district || previous.district,
         taluk: result.taluk || previous.taluk,
+        state: result.state || previous.state,
         pincodeCheck: result,
       }));
     } finally {
@@ -1741,8 +1942,8 @@ export default function App() {
 
   const handleSaveDeliveryAddress = async (event: React.FormEvent) => {
     event.preventDefault();
-    if (!address.fullName.trim() || !address.phone.trim() || !address.street1?.trim() || !address.street2?.trim() || !address.landmark1.trim() || !address.taluk?.trim() || !address.district?.trim() || !/^\d{6}$/.test(address.pincode)) {
-      alert('Complete all required delivery-address fields before saving.');
+    if (!address.fullName.trim() || !address.phone.trim() || !address.street1?.trim() || !address.city?.trim() || !address.landmark1.trim() || !address.district?.trim() || !/^\d{6}$/.test(address.pincode)) {
+      alert(tr('Complete all required delivery-address fields before saving.'));
       return;
     }
     const savedAddress: SavedDeliveryAddress = {
@@ -1815,6 +2016,7 @@ export default function App() {
   })();
 
   const newEnquiryCount = enquiries.filter(item => item.status === 'NEW').length;
+  const newFeedbackCount = feedbackItems.filter(item => item.status === 'NEW').length;
 
   const firstInFirstOut = (left: Order, right: Order) => left.createdAt.localeCompare(right.createdAt);
   const hostActiveOrders = activeOrders
@@ -1833,6 +2035,7 @@ export default function App() {
       : hostHistoryOrders;
 
   return (
+    <TrContext.Provider value={tr}>
     <div style={{ fontFamily: 'Georgia, serif', backgroundColor: '#fdf8f6', color: '#333', minHeight: '100vh' }}>
       
       <style>{`
@@ -1845,21 +2048,20 @@ export default function App() {
       <div style={{ backgroundColor: '#1a050d', color: '#fff', padding: '0.6rem 1.2rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.5rem', fontSize: '0.85rem' }}>
         <div>
           {isStaff || !firebaseConfigured ? (
-            <span>Role: <strong>{firebaseConfigured ? firebaseLoading ? 'CHECKING ACCESS' : firebaseUser ? role === 'OWNER' ? 'HOST' : role : 'GUEST' : `LOCAL ${role === 'OWNER' ? 'HOST' : role}`}</strong> ({firebaseConfigured ? firebaseUser?.email || 'signed out' : userEmail})</span>
+            <span>{tr('Role:')} <strong>{firebaseConfigured ? firebaseLoading ? tr('CHECKING ACCESS') : firebaseUser ? role === 'OWNER' ? tr('HOST') : role : tr('GUEST') : `LOCAL ${role === 'OWNER' ? 'HOST' : role}`}</strong> ({firebaseConfigured ? firebaseUser?.email || 'signed out' : userEmail})</span>
           ) : googleUser ? (
             <span>{googleUser.email}</span>
           ) : null}
         </div>
         <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center' }}>
-          <select value={lang} onChange={(e) => setLang(e.target.value as Language)} style={{ padding: '0.25rem', borderRadius: '4px' }}>
-            <option value="en">English</option>
-            <option value="kn">ಕನ್ನಡ (Kannada)</option>
+          <select aria-label={tr('Language')} value={lang} onChange={(e) => setLang(e.target.value as UiLanguage)} style={{ padding: '0.25rem', borderRadius: '4px' }}>
+            {LANGUAGES.map(language => <option key={language.code} value={language.code}>{language.label}</option>)}
           </select>
           {firebaseConfigured ? (
             googleUser ? (
-              <button onClick={handleSignOut} style={{ padding: '0.35rem 0.9rem', cursor: 'pointer', borderRadius: '999px', border: '1px solid #dadce0', backgroundColor: '#fff', color: '#3c4043', fontWeight: 600 }}>Sign out</button>
+              <button onClick={handleSignOut} style={{ padding: '0.35rem 0.9rem', cursor: 'pointer', borderRadius: '999px', border: '1px solid #dadce0', backgroundColor: '#fff', color: '#3c4043', fontWeight: 600 }}>{tr('Sign out')}</button>
             ) : (
-              <GoogleSignInButton onClick={() => void handleGoogleSignIn()} disabled={firebaseLoading} label={firebaseLoading ? 'Checking session...' : 'Sign in with Google'} />
+              <GoogleSignInButton onClick={() => void handleGoogleSignIn()} disabled={firebaseLoading} label={firebaseLoading ? tr('Checking session...') : tr('Sign in with Google')} />
             )
           ) : (
             <select value={userEmail} onChange={(e) => handleEmailSwitch(e.target.value)} style={{ padding: '0.25rem', borderRadius: '4px' }}>
@@ -1897,6 +2099,8 @@ export default function App() {
           onDismiss={dismissOffer}
         />
       )}
+
+      {!isStaff && <ValueStrip />}
 
       {/* MAIN CONTENT AREA */}
       <div style={{ maxWidth: '1100px', margin: '2rem auto', padding: '0 1rem' }}>
@@ -1958,6 +2162,7 @@ export default function App() {
                 ['CATALOG', `Manage catalog (${products.length})`],
                 ['QR', 'Payment QR'],
                 ['ENQUIRIES', `Enquiries${newEnquiryCount ? ` (${newEnquiryCount} new)` : ''}`],
+                ['FEEDBACK', `Feedback${newFeedbackCount ? ` (${newFeedbackCount} new)` : ''}`],
                 ['INSIGHTS', 'AI insights'],
               ] as const).map(([tab, label]) => (
                 <button key={tab} type="button" role="tab" aria-selected={hostTab === tab} onClick={() => setHostTab(tab)} style={{ padding: '0.65rem 0.9rem', border: 0, borderBottom: hostTab === tab ? '3px solid #6e1a3a' : '3px solid transparent', background: 'transparent', color: '#6e1a3a', fontWeight: 'bold', cursor: 'pointer', whiteSpace: 'nowrap' }}>
@@ -2066,8 +2271,14 @@ export default function App() {
             <div style={{ backgroundColor: '#fff', padding: '1.2rem', border: '1px solid #ddd', borderRadius: '8px', marginBottom: '2rem' }}>
               <h3 style={{ margin: '0 0 0.3rem' }}>Customer enquiries ({enquiries.filter(item => item.status === 'NEW').length} new)</h3>
               <p style={{ margin: '0 0 0.8rem', color: '#666', fontSize: '0.85rem' }}>
-                Customers write to you from the chat button on the website. Your own WhatsApp number is never shown to them. Reply on WhatsApp using the customer's number.
+                Customers write to you from the chat button on the website. Reply on WhatsApp using the customer's number. Your own number stays hidden unless you add one below as an optional "message us directly" choice.
               </p>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.6rem', alignItems: 'center', margin: '0 0 1rem' }}>
+                <input type="tel" inputMode="numeric" aria-label="Optional direct WhatsApp number" placeholder="Optional direct WhatsApp number" value={whatsAppDraft} onChange={event => setWhatsAppDraft(event.target.value)} style={{ padding: '0.5rem', flex: '1 1 220px' }} />
+                <button type="button" onClick={() => void handleSaveWhatsApp(whatsAppDraft)} style={{ backgroundColor: '#6e1a3a', color: '#fff', border: 'none', padding: '0.5rem 1rem', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold' }}>Save number</button>
+                {hostWhatsApp && <button type="button" onClick={() => void handleSaveWhatsApp('')} style={{ padding: '0.5rem 1rem', cursor: 'pointer' }}>Remove number</button>}
+                <small style={{ color: '#777', flexBasis: '100%' }}>{hostWhatsApp ? 'Customers now see a "message us directly" link in the chat, which shows this number to those who use it.' : 'No number saved. Customers can only send enquiries through the form.'}</small>
+              </div>
               {enquiries.length === 0 ? (
                 <p style={{ margin: 0, color: '#666', fontStyle: 'italic' }}>No enquiries yet.</p>
               ) : (
@@ -2151,11 +2362,27 @@ export default function App() {
               </p>
             ) : hostVisibleOrders.map(ord => {
               const canDispatch = Boolean(ord.deliveryConfirmed && ord.itemPayment?.verified) && (!ord.courierBill || Boolean(ord.courierPayment?.verified));
+              const open = Boolean(expandedOrders[ord.orderId]);
               return (
-                <article key={ord.orderId} style={{ border: '1px solid #ddd', padding: '1rem', borderRadius: '8px', marginBottom: '1rem' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', gap: '0.8rem', flexWrap: 'wrap', fontWeight: 'bold' }}>
-                    <span>Order #{ord.orderId}</span>
-                    <span style={{ color: '#6e1a3a' }}>{getOrderStatus(ord)}</span>
+                <article key={ord.orderId} className={`mr-order-row${open ? ' is-open' : ''}`} style={{ border: '1px solid #ddd', padding: '0.8rem 1rem', borderRadius: '8px', marginBottom: '0.7rem', background: '#fff' }}>
+                  <div className="mr-quick" role="tooltip">
+                    <strong>{ord.address.fullName}</strong> · {ord.address.phone}<br />
+                    {ord.items.map(item => `${item.name} × ${item.quantity}`).join(', ')}<br />
+                    {getOrderStatus(ord)}{ord.itemPayment ? ` · UTR ${ord.itemPayment.utr}` : ''}<br />
+                    {[ord.address.city, ord.address.district, ord.address.pincode].filter(Boolean).join(', ')}
+                  </div>
+                  <button type="button" className="mr-order-head" aria-expanded={open} onClick={() => toggleOrder(ord.orderId)}>
+                    <span style={{ minWidth: 0 }}><span className="mr-order-label">Customer</span><div className="mr-order-value">{ord.address.fullName}</div></span>
+                    <span className="mr-col-id" style={{ minWidth: 0 }}><span className="mr-order-label">Order ID</span><div className="mr-order-value" style={{ fontFamily: 'monospace' }}>{ord.orderId}</div></span>
+                    <span className="mr-col-date" style={{ minWidth: 0 }}><span className="mr-order-label">Date</span><div className="mr-order-value">{new Date(ord.createdAt).toLocaleDateString()}</div></span>
+                    <span><span className="mr-order-label">Amount</span><div className="mr-order-value" style={{ color: '#6e1a3a' }}>₹{ord.itemTotal}</div></span>
+                    <span className="mr-chevron" aria-hidden="true">›</span>
+                  </button>
+                  {open && (
+                  <div className="mr-expand">
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.6rem', alignItems: 'center', marginTop: '0.6rem' }}>
+                    <span className="mr-status-chip">{getOrderStatus(ord)}</span>
+                    {ord.rejectionReason && <span style={{ fontSize: '0.85rem', color: '#8b1e2d' }}>Rejected: {ord.rejectionReason}</span>}
                   </div>
                   <p style={{ fontSize: '0.85rem', margin: '0.45rem 0', color: '#555' }}>
                     Received {new Date(ord.createdAt).toLocaleString()} · Updated {new Date(ord.updatedAt).toLocaleString()}
@@ -2167,7 +2394,7 @@ export default function App() {
                   <div style={{ margin: '0.6rem 0', padding: '0.75rem', background: '#f7f2ef', borderRadius: '5px' }}>
                     <strong>Delivery address</strong>
                     <p style={{ margin: '0.35rem 0' }}>
-                      {[ord.address.houseNameOrNumber, ord.address.street1, ord.address.street2, ord.address.landmark1, ord.address.landmark2, ord.address.taluk, ord.address.district, ord.address.pincode].filter(Boolean).join(', ') || ord.address.street}
+                      {[ord.address.houseNameOrNumber, ord.address.street1, ord.address.street2, ord.address.landmark1, ord.address.landmark2, ord.address.city, ord.address.taluk, ord.address.district, ord.address.pincode].filter(Boolean).join(', ') || ord.address.street}
                     </p>
                     {ord.address.pincodeCheck && <p style={{ margin: '0.25rem 0', fontSize: '0.85rem' }}>{ord.address.pincodeCheck.provider}: {ord.address.pincodeCheck.message}</p>}
                     {ord.deliveryConfirmed ? (
@@ -2207,8 +2434,10 @@ export default function App() {
                   <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', marginTop: '0.8rem' }}>
                     {hostOrderTab === 'ACTIVE' && <button type="button" disabled={!canDispatch} onClick={() => void handleDispatch(ord.orderId)} style={{ backgroundColor: '#6e1a3a', color: '#fff', border: 'none', padding: '0.45rem 0.8rem', borderRadius: '4px', cursor: canDispatch ? 'pointer' : 'not-allowed' }}>{t.markDispatched}</button>}
                     {hostOrderTab === 'DISPATCHED' && <button type="button" onClick={() => void handleDelivered(ord.orderId)} style={{ backgroundColor: '#2e7d32', color: '#fff', border: 'none', padding: '0.45rem 0.8rem', borderRadius: '4px', cursor: 'pointer' }}>Mark delivered</button>}
-                    {hostOrderTab === 'ACTIVE' && <button type="button" onClick={() => void handleNotAccepted(ord.orderId)} style={{ backgroundColor: '#fff', color: '#8b1e2d', border: '1px solid #8b1e2d', padding: '0.45rem 0.8rem', borderRadius: '4px', cursor: 'pointer' }}>Not accepted</button>}
                   </div>
+                  <HostOrderActions key={`${ord.orderId}-${ord.hostMessageAt || 'new'}`} order={ord} canReject={hostOrderTab === 'ACTIVE'} onReject={handleRejectOrder} onSaveMessage={handleSaveOrderMessage} />
+                  </div>
+                  )}
                 </article>
               );
             })}
@@ -2216,6 +2445,10 @@ export default function App() {
 
             {hostTab === 'LEDGER' && (
               <MasterLedger orders={activeOrders} products={products} onSaveDelivery={handleUpdateDelivery} />
+            )}
+
+            {hostTab === 'FEEDBACK' && (
+              <FeedbackPanel feedback={feedbackItems} onStatus={handleFeedbackStatus} onDelete={handleDeleteFeedback} />
             )}
 
             {hostTab === 'INSIGHTS' && (
@@ -2229,7 +2462,7 @@ export default function App() {
         {/* ------------------------------------------------------------------------- */}
         {!firebaseLoading && role === 'CUSTOMER' && (
           <div>
-            <nav aria-label="Customer sections" style={{ display: 'flex', gap: '0.5rem', borderBottom: '1px solid #ddd', marginBottom: '1.4rem' }}>
+            <nav aria-label={tr('Customer sections')} style={{ display: 'flex', gap: '0.5rem', borderBottom: '1px solid #ddd', marginBottom: '1.4rem' }}>
               <button
                 type="button"
                 role="tab"
@@ -2237,7 +2470,7 @@ export default function App() {
                 onClick={() => setCustomerTab('SHOP')}
                 style={{ padding: '0.7rem 1rem', border: 0, borderBottom: customerTab === 'SHOP' ? '3px solid #6e1a3a' : '3px solid transparent', background: 'transparent', color: '#6e1a3a', fontWeight: 'bold', cursor: 'pointer' }}
               >
-                Shop
+                {tr('Shop')}
               </button>
               <button
                 type="button"
@@ -2246,7 +2479,7 @@ export default function App() {
                 onClick={() => setCustomerTab('ORDERS')}
                 style={{ padding: '0.7rem 1rem', border: 0, borderBottom: customerTab === 'ORDERS' ? '3px solid #6e1a3a' : '3px solid transparent', background: 'transparent', color: '#6e1a3a', fontWeight: 'bold', cursor: 'pointer' }}
               >
-                Recent orders{activeOrders.length > 0 ? ` (${activeOrders.length})` : ''}
+                {tr('Recent orders')}{activeOrders.length > 0 ? ` (${activeOrders.length})` : ''}
               </button>
               <button
                 type="button"
@@ -2255,17 +2488,27 @@ export default function App() {
                 onClick={() => setCustomerTab('ADDRESSES')}
                 style={{ padding: '0.7rem 1rem', border: 0, borderBottom: customerTab === 'ADDRESSES' ? '3px solid #6e1a3a' : '3px solid transparent', background: 'transparent', color: '#6e1a3a', fontWeight: 'bold', cursor: 'pointer' }}
               >
-                Addresses{savedAddresses.length > 0 ? ` (${savedAddresses.length})` : ''}
+                {tr('Addresses')}{savedAddresses.length > 0 ? ` (${savedAddresses.length})` : ''}
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={customerTab === 'ABOUT'}
+                onClick={() => setCustomerTab('ABOUT')}
+                style={{ padding: '0.7rem 1rem', border: 0, borderBottom: customerTab === 'ABOUT' ? '3px solid #6e1a3a' : '3px solid transparent', background: 'transparent', color: '#6e1a3a', fontWeight: 'bold', cursor: 'pointer' }}
+              >
+                {tr('About')}
               </button>
             </nav>
 
+            <div key={customerTab} className="mr-tab-in">
             {customerTab === 'ADDRESSES' && (
-              <section aria-label="Saved delivery addresses">
-                <h2 style={{ color: '#6e1a3a', marginTop: 0 }}>Delivery addresses</h2>
+              <section aria-label={tr('Saved delivery addresses')}>
+                <h2 style={{ color: '#6e1a3a', marginTop: 0 }}>{tr('Delivery addresses')}</h2>
                 {firebaseConfigured && !googleUser && (
                   <div style={{ marginBottom: '1rem' }}>
-                    <p role="status" style={{ marginTop: 0 }}>Sign in with Google to save addresses to your account.</p>
-                    <GoogleSignInButton onClick={() => void handleGoogleSignIn()} disabled={firebaseLoading} label="Sign in with Google" />
+                    <p role="status" style={{ marginTop: 0 }}>{tr('Sign in with Google to save addresses to your account.')}</p>
+                    <GoogleSignInButton onClick={() => void handleGoogleSignIn()} disabled={firebaseLoading} label={tr('Sign in with Google')} />
                   </div>
                 )}
                 <div style={{ display: 'grid', gap: '0.7rem', marginBottom: '1.2rem' }}>
@@ -2273,29 +2516,31 @@ export default function App() {
                     <article key={saved.id} style={{ backgroundColor: '#fff', border: '1px solid #ddd', borderRadius: '6px', padding: '0.9rem' }}>
                       <strong>{saved.fullName} · {saved.phone}</strong>
                       <p style={{ margin: '0.35rem 0', color: '#555' }}>
-                        {[saved.houseNameOrNumber, saved.street1, saved.street2, saved.landmark1, saved.landmark2, saved.taluk, saved.district, saved.pincode].filter(Boolean).join(', ')}
+                        {[saved.houseNameOrNumber, saved.street1, saved.street2, saved.landmark1, saved.landmark2, saved.city, saved.taluk, saved.district, saved.pincode].filter(Boolean).join(', ')}
                       </p>
                       <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem' }}>
-                        <button type="button" onClick={() => { selectDeliveryAddress(saved.id); setCustomerTab('SHOP'); setIsCheckoutOpen(true); setCheckoutStep(1); }} style={{ padding: '0.45rem 0.7rem' }}>Use at checkout</button>
-                        <button type="button" onClick={() => { setAddress({ ...saved }); setEditingAddressId(saved.id); }} style={{ padding: '0.45rem 0.7rem' }}>Edit</button>
-                        <button type="button" onClick={() => void handleDeleteDeliveryAddress(saved.id)} style={{ padding: '0.45rem 0.7rem' }}>Delete</button>
+                        <button type="button" onClick={() => { selectDeliveryAddress(saved.id); setCustomerTab('SHOP'); setIsCheckoutOpen(true); setCheckoutStep(1); }} style={{ padding: '0.45rem 0.7rem' }}>{tr('Use at checkout')}</button>
+                        <button type="button" onClick={() => { setAddress({ ...saved }); setEditingAddressId(saved.id); }} style={{ padding: '0.45rem 0.7rem' }}>{tr('Edit')}</button>
+                        <button type="button" onClick={() => void handleDeleteDeliveryAddress(saved.id)} style={{ padding: '0.45rem 0.7rem' }}>{tr('Delete')}</button>
                       </div>
                     </article>
                   ))}
                 </div>
                 <form onSubmit={handleSaveDeliveryAddress} style={{ backgroundColor: '#fff', border: '1px solid #ddd', borderRadius: '6px', padding: '1rem', display: 'grid', gap: '0.8rem' }}>
-                  <h3 style={{ margin: 0 }}>{editingAddressId ? 'Edit address' : 'Add a delivery address'}</h3>
+                  <h3 style={{ margin: 0 }}>{editingAddressId ? tr('Edit address') : tr('Add a delivery address')}</h3>
                   <DeliveryAddressFields address={address} setAddress={setAddress} isCheckingPincode={isCheckingPincode} onCheckPincode={() => void handleCheckPincode()} />
                   <button type="submit" style={{ justifySelf: 'start', backgroundColor: '#6e1a3a', color: '#fff', border: 0, borderRadius: '4px', padding: '0.6rem 0.9rem', cursor: 'pointer' }}>
-                    {editingAddressId ? 'Save address changes' : 'Save address'}
+                    {editingAddressId ? tr('Save address changes') : tr('Save address')}
                   </button>
-                  {editingAddressId && <button type="button" onClick={() => { setEditingAddressId(null); setAddress({ fullName: '', phone: '', houseNameOrNumber: '', street1: '', street2: '', street: '', landmark1: '', landmark2: '', taluk: '', district: '', pincode: '', consentTimestamp: '' }); }} style={{ justifySelf: 'start' }}>Cancel editing</button>}
+                  {editingAddressId && <button type="button" onClick={() => { setEditingAddressId(null); setAddress({ fullName: '', phone: '', houseNameOrNumber: '', street1: '', street2: '', street: '', landmark1: '', landmark2: '', taluk: '', district: '', pincode: '', consentTimestamp: '' }); }} style={{ justifySelf: 'start' }}>{tr('Cancel editing')}</button>}
                 </form>
               </section>
             )}
 
             {customerTab === 'SHOP' && (
               <>
+            <StoryShowcase products={products} onSelect={product => focusProduct(product.id)} />
+
             {/* Filter Bar & Cart Button */}
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem', flexWrap: 'wrap', gap: '1rem' }}>
               <div>
@@ -2314,7 +2559,7 @@ export default function App() {
                       fontWeight: 'bold'
                     }}
                   >
-                    {cat}
+                    {tr(cat)}
                   </button>
                 ))}
               </div>
@@ -2323,54 +2568,54 @@ export default function App() {
                 onClick={() => setIsCartOpen(true)}
                 style={{ backgroundColor: '#6e1a3a', color: '#fff', border: 'none', padding: '0.6rem 1.4rem', borderRadius: '25px', fontWeight: 'bold', cursor: 'pointer' }}
               >
-                View cart · {cartCount} item{cartCount === 1 ? '' : 's'} · ₹{cartTotal}
+                {tr(cartCount === 1 ? 'View cart · {count} item · ₹{total}' : 'View cart · {count} items · ₹{total}', { count: cartCount, total: cartTotal })}
               </button>
             </div>
 
             {/* Sort and filter */}
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.8rem 1.2rem', alignItems: 'center', marginBottom: '1.2rem', fontSize: '0.9rem' }}>
               <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
-                Sort by
+                {tr('Sort by')}
                 <select value={sortBy} onChange={event => setSortBy(event.target.value as SortKey)} style={{ padding: '0.4rem' }}>
-                  <option value="featured">Featured</option>
-                  <option value="newest">Newest first</option>
-                  <option value="price-asc">Price: low to high</option>
-                  <option value="price-desc">Price: high to low</option>
-                  <option value="discount">Biggest discount</option>
-                  <option value="in-stock">In stock first</option>
+                  <option value="featured">{tr('Featured')}</option>
+                  <option value="newest">{tr('Newest first')}</option>
+                  <option value="price-asc">{tr('Price: low to high')}</option>
+                  <option value="price-desc">{tr('Price: high to low')}</option>
+                  <option value="discount">{tr('Biggest discount')}</option>
+                  <option value="in-stock">{tr('In stock first')}</option>
                 </select>
               </label>
               <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', cursor: 'pointer' }}>
                 <input type="checkbox" checked={onlyInStock} onChange={event => setOnlyInStock(event.target.checked)} />
-                In stock only
+                {tr('In stock only')}
               </label>
               <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', cursor: 'pointer' }}>
                 <input type="checkbox" checked={onlyOffers} onChange={event => setOnlyOffers(event.target.checked)} />
-                On offer
+                {tr('On offer')}
               </label>
-              <span style={{ color: '#777' }}>{filteredProducts.length} item{filteredProducts.length === 1 ? '' : 's'}</span>
+              <span style={{ color: '#777' }}>{tr(filteredProducts.length === 1 ? '{count} item' : '{count} items', { count: filteredProducts.length })}</span>
               {(categoryFilter !== 'All' || onlyInStock || onlyOffers || sortBy !== 'featured') && (
-                <button type="button" onClick={() => { setCategoryFilter('All'); setOnlyInStock(false); setOnlyOffers(false); setSortBy('featured'); }} style={{ background: 'none', border: 'none', color: '#6e1a3a', textDecoration: 'underline', cursor: 'pointer' }}>Clear filters</button>
+                <button type="button" onClick={() => { setCategoryFilter('All'); setOnlyInStock(false); setOnlyOffers(false); setSortBy('featured'); }} style={{ background: 'none', border: 'none', color: '#6e1a3a', textDecoration: 'underline', cursor: 'pointer' }}>{tr('Clear filters')}</button>
               )}
             </div>
-            {filteredProducts.length === 0 && <p role="status" style={{ color: '#666' }}>No items match these filters.</p>}
+            {filteredProducts.length === 0 && <p role="status" style={{ color: '#666' }}>{tr('No items match these filters.')}</p>}
 
             {/* Catalog Grid */}
             <div id="mr-catalog" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(250px, 1fr))', gap: '1.8rem', scrollMarginTop: '100px' }}>
               {filteredProducts.map(product => (
-                <div key={product.id} style={{ backgroundColor: '#fff', borderRadius: '10px', overflow: 'hidden', boxShadow: '0 4px 12px rgba(0,0,0,0.08)', display: 'flex', flexDirection: 'column' }}>
+                <div key={product.id} id={`product-${product.id}`} style={{ backgroundColor: '#fff', borderRadius: '10px', overflow: 'hidden', boxShadow: highlightedProductId === product.id ? '0 0 0 3px #d9a441, 0 12px 30px rgba(110,26,58,0.35)' : '0 4px 12px rgba(0,0,0,0.08)', transition: 'box-shadow 0.4s ease', display: 'flex', flexDirection: 'column' }}>
                   <ProductGallery product={product} badges={cardBadges(product)} onView={() => trackProductView(product.id, product.category)} />
                   <div style={{ padding: '1rem', flex: 1, display: 'flex', flexDirection: 'column', justifyContent: 'space-between' }}>
                     <div>
-                      <span style={{ fontSize: '0.75rem', color: '#6e1a3a', fontWeight: 'bold', textTransform: 'uppercase' }}>{product.category}</span>
+                      <span style={{ fontSize: '0.75rem', color: '#6e1a3a', fontWeight: 'bold', textTransform: 'uppercase' }}>{tr(product.category)}</span>
                       <h3 style={{ margin: '0.3rem 0', fontSize: '1.1rem' }}>{product.name}</h3>
                       <p style={{ fontSize: '0.85rem', color: '#666', lineHeight: '1.3' }}>{product.description}</p>
                       {typeof product.quantity === 'number' && product.quantity > 0 && product.quantity <= 3 && effectiveStatus(product) === 'AVAILABLE' && (
-                        <p style={{ margin: '0.2rem 0', color: '#b45309', fontSize: '0.8rem', fontWeight: 'bold' }}>Only {product.quantity} left</p>
+                        <p style={{ margin: '0.2rem 0', color: '#b45309', fontSize: '0.8rem', fontWeight: 'bold' }}>{tr('Only {count} left', { count: product.quantity })}</p>
                       )}
                       <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.9rem', marginTop: '0.3rem' }}>
-                        <button type="button" onClick={() => openEnquiry(product)} style={linkButtonStyle}>💬 Ask about this</button>
-                        <button type="button" onClick={() => shareProduct(product)} style={linkButtonStyle}>↗ Share</button>
+                        <button type="button" onClick={() => openEnquiry(product)} style={linkButtonStyle}>{tr('💬 Ask about this')}</button>
+                        <button type="button" onClick={() => shareProduct(product)} style={linkButtonStyle}>{tr('↗ Share')}</button>
                       </div>
                     </div>
                     <div style={{ marginTop: '1rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
@@ -2390,18 +2635,18 @@ export default function App() {
                             onClick={() => { addToCart(product); trackAddToCart(product.id, product.category); }}
                             style={{ backgroundColor: '#fff', color: '#6e1a3a', border: '1px solid #6e1a3a', padding: '0.45rem 0.65rem', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}
                           >
-                            + Add
+                            {tr('+ Add')}
                           </button>
                           <button
                             onClick={() => buyNow(product)}
                             style={{ backgroundColor: '#6e1a3a', color: '#fff', border: 'none', padding: '0.45rem 0.65rem', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}
                           >
-                            Buy now
+                            {tr('Buy now')}
                           </button>
                         </div>
                       ) : (
                         <span style={{ ...STATUS_COLORS[effectiveStatus(product)], fontSize: '0.85rem', fontWeight: 'bold', padding: '0.4rem 0.8rem', borderRadius: '999px' }}>
-                          {STATUS_LABELS[effectiveStatus(product)]}
+                          {tr(STATUS_LABELS[effectiveStatus(product)])}
                         </span>
                       )}
                     </div>
@@ -2410,17 +2655,19 @@ export default function App() {
               ))}
             </div>
 
+            <HowItWorks />
+
             {/* Cart Drawer */}
             {isCartOpen && (
               <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.6)', display: 'flex', justifyContent: 'center', alignItems: 'center', zIndex: 1000, padding: '1rem' }}>
-                <div role="dialog" aria-label="Shopping cart" style={{ backgroundColor: '#fff', maxWidth: '550px', width: '100%', maxHeight: '90vh', overflowY: 'auto', borderRadius: '12px', padding: '1.8rem', position: 'relative' }}>
-                  <button type="button" aria-label="Close cart" onClick={() => setIsCartOpen(false)} style={{ position: 'absolute', top: '15px', right: '15px', border: 'none', background: 'none', fontSize: '1.2rem', cursor: 'pointer' }}>✕</button>
-                  <h2 style={{ color: '#6e1a3a', marginTop: 0 }}>Your cart</h2>
+                <div role="dialog" aria-label={tr('Shopping cart')} style={{ backgroundColor: '#fff', maxWidth: '550px', width: '100%', maxHeight: '90vh', overflowY: 'auto', borderRadius: '12px', padding: '1.8rem', position: 'relative' }}>
+                  <button type="button" aria-label={tr('Close cart')} onClick={() => setIsCartOpen(false)} style={{ position: 'absolute', top: '15px', right: '15px', border: 'none', background: 'none', fontSize: '1.2rem', cursor: 'pointer' }}>✕</button>
+                  <h2 style={{ color: '#6e1a3a', marginTop: 0 }}>{tr('Your cart')}</h2>
 
                   {cart.length === 0 ? (
                     <div>
-                      <p>Your cart is empty.</p>
-                      <button type="button" onClick={() => setIsCartOpen(false)} style={{ backgroundColor: '#6e1a3a', color: '#fff', border: 'none', padding: '0.7rem 1rem', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}>Continue shopping</button>
+                      <p>{tr('Your cart is empty.')}</p>
+                      <button type="button" onClick={() => setIsCartOpen(false)} style={{ backgroundColor: '#6e1a3a', color: '#fff', border: 'none', padding: '0.7rem 1rem', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}>{tr('Continue shopping')}</button>
                     </div>
                   ) : (
                     <>
@@ -2430,12 +2677,12 @@ export default function App() {
                             <img src={line.product.image} alt="" style={{ width: '64px', height: '64px', objectFit: 'cover', borderRadius: '6px', flex: '0 0 64px' }} />
                             <div style={{ flex: 1, minWidth: 0 }}>
                               <strong>{line.product.name}</strong>
-                              <div style={{ fontSize: '0.85rem', color: '#666' }}>₹{unitPrice(line.product)} each{typeof line.product.quantity === 'number' && line.product.quantity <= 5 ? ` · only ${line.product.quantity} left` : ''}</div>
+                              <div style={{ fontSize: '0.85rem', color: '#666' }}>{tr('₹{price} each', { price: unitPrice(line.product) })}{typeof line.product.quantity === 'number' && line.product.quantity <= 5 ? ` · ${tr('only {count} left', { count: line.product.quantity })}` : ''}</div>
                               <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.4rem', marginTop: '0.4rem' }}>
                                 <button type="button" aria-label={`Decrease quantity of ${line.product.name}`} onClick={() => changeQuantity(line.product.id, -1)} style={{ width: '30px', height: '30px', cursor: 'pointer' }}>−</button>
                                 <span aria-live="polite" style={{ minWidth: '1.5rem', textAlign: 'center', fontWeight: 'bold' }}>{line.quantity}</span>
                                 <button type="button" aria-label={`Increase quantity of ${line.product.name}`} disabled={line.quantity >= maxOrderable(line.product)} onClick={() => changeQuantity(line.product.id, 1)} style={{ width: '30px', height: '30px', cursor: line.quantity >= maxOrderable(line.product) ? 'not-allowed' : 'pointer' }}>+</button>
-                                <button type="button" onClick={() => removeFromCart(line.product.id)} style={{ marginLeft: '0.4rem', background: 'none', border: 'none', color: '#8b1e2d', textDecoration: 'underline', cursor: 'pointer' }}>Remove</button>
+                                <button type="button" onClick={() => removeFromCart(line.product.id)} style={{ marginLeft: '0.4rem', background: 'none', border: 'none', color: '#8b1e2d', textDecoration: 'underline', cursor: 'pointer' }}>{tr('Remove')}</button>
                               </div>
                             </div>
                             <div style={{ fontWeight: 'bold', color: '#6e1a3a' }}>₹{unitPrice(line.product) * line.quantity}</div>
@@ -2445,24 +2692,24 @@ export default function App() {
 
                       <div style={{ borderTop: '2px solid #6e1a3a', marginTop: '1rem', paddingTop: '0.8rem' }}>
                         <div style={{ display: 'flex', justifyContent: 'space-between', gap: '1rem' }}>
-                          <span>Items ({cartCount})</span>
+                          <span>{tr('Items ({count})', { count: cartCount })}</span>
                           <span>₹{cartTotal}</span>
                         </div>
                         <div style={{ display: 'flex', justifyContent: 'space-between', gap: '1rem', marginTop: '0.4rem', fontWeight: 'bold', fontSize: '1.1rem' }}>
-                          <span>Order total</span>
+                          <span>{tr('Order total')}</span>
                           <span style={{ color: '#6e1a3a' }}>₹{cartTotal}</span>
                         </div>
-                        <p style={{ color: '#666', fontSize: '0.8rem', marginBottom: 0 }}>Courier charges are billed separately after your order is confirmed.</p>
+                        <p style={{ color: '#666', fontSize: '0.8rem', marginBottom: 0 }}>{tr('Courier charges are billed separately after your order is confirmed.')}</p>
                         {unavailableLines.length > 0 && (
                           <p role="alert" style={{ color: '#8b1e2d', fontSize: '0.85rem', marginBottom: 0 }}>
-                            Please update or remove: {unavailableLines.map(line => line.product.name).join(', ')}. {unavailableLines.length === 1 ? 'It is' : 'They are'} no longer available, or there is not enough stock.
+                            {tr('Please update or remove: {names}.', { names: unavailableLines.map(line => line.product.name).join(', ') })} {tr(unavailableLines.length === 1 ? 'It is no longer available, or there is not enough stock.' : 'They are no longer available, or there is not enough stock.')}
                           </p>
                         )}
                       </div>
 
                       <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.6rem', marginTop: '1.2rem' }}>
-                        <button type="button" onClick={() => setIsCartOpen(false)} style={{ flex: '1 1 140px', backgroundColor: '#fff', color: '#6e1a3a', border: '1px solid #6e1a3a', padding: '0.7rem', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}>Continue shopping</button>
-                        <button type="button" disabled={unavailableLines.length > 0} onClick={() => { setIsCartOpen(false); setCheckoutStep(1); setIsCheckoutOpen(true); }} style={{ flex: '1 1 140px', backgroundColor: '#6e1a3a', color: '#fff', border: 'none', padding: '0.7rem', borderRadius: '6px', cursor: unavailableLines.length > 0 ? 'not-allowed' : 'pointer', opacity: unavailableLines.length > 0 ? 0.6 : 1, fontWeight: 'bold' }}>Proceed to checkout</button>
+                        <button type="button" onClick={() => setIsCartOpen(false)} style={{ flex: '1 1 140px', backgroundColor: '#fff', color: '#6e1a3a', border: '1px solid #6e1a3a', padding: '0.7rem', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}>{tr('Continue shopping')}</button>
+                        <button type="button" disabled={unavailableLines.length > 0} onClick={() => { setIsCartOpen(false); setCheckoutStep(1); setIsCheckoutOpen(true); }} style={{ flex: '1 1 140px', backgroundColor: '#6e1a3a', color: '#fff', border: 'none', padding: '0.7rem', borderRadius: '6px', cursor: unavailableLines.length > 0 ? 'not-allowed' : 'pointer', opacity: unavailableLines.length > 0 ? 0.6 : 1, fontWeight: 'bold' }}>{tr('Proceed to checkout')}</button>
                       </div>
                     </>
                   )}
@@ -2476,13 +2723,13 @@ export default function App() {
                 <div style={{ backgroundColor: '#fff', maxWidth: '550px', width: '100%', maxHeight: '90vh', overflowY: 'auto', borderRadius: '12px', padding: '1.8rem', position: 'relative' }}>
                   <button onClick={() => setIsCheckoutOpen(false)} style={{ position: 'absolute', top: '15px', right: '15px', border: 'none', background: 'none', fontSize: '1.2rem', cursor: 'pointer' }}>✕</button>
 
-                  <h2 style={{ color: '#6e1a3a', marginTop: 0 }}>Checkout</h2>
+                  <h2 style={{ color: '#6e1a3a', marginTop: 0 }}>{tr('Checkout')}</h2>
 
                   {/* Order Summary */}
                   <div style={{ backgroundColor: '#f7f2ef', padding: '0.8rem', borderRadius: '6px', marginBottom: '1.2rem', fontSize: '0.9rem' }}>
-                    <strong>Order summary</strong>
+                    <strong>{tr('Order summary')}</strong>
                     {cart.length === 0 ? (
-                      <p style={{ margin: '0.4rem 0 0' }}>Your cart is empty.</p>
+                      <p style={{ margin: '0.4rem 0 0' }}>{tr('Your cart is empty.')}</p>
                     ) : cart.map(line => (
                       <div key={line.product.id} style={{ display: 'flex', justifyContent: 'space-between', gap: '0.5rem', marginTop: '0.35rem' }}>
                         <span>{line.product.name} × {line.quantity}</span>
@@ -2490,10 +2737,10 @@ export default function App() {
                       </div>
                     ))}
                     <div style={{ display: 'flex', justifyContent: 'space-between', gap: '0.5rem', marginTop: '0.5rem', fontWeight: 'bold' }}>
-                      <span>Order total</span>
+                      <span>{tr('Order total')}</span>
                       <span>₹{cartTotal}</span>
                     </div>
-                    <button type="button" onClick={() => { setIsCheckoutOpen(false); setIsCartOpen(true); }} style={{ marginTop: '0.5rem', padding: '0.35rem 0.7rem', cursor: 'pointer' }}>Edit cart</button>
+                    <button type="button" onClick={() => { setIsCheckoutOpen(false); setIsCartOpen(true); }} style={{ marginTop: '0.5rem', padding: '0.35rem 0.7rem', cursor: 'pointer' }}>{tr('Edit cart')}</button>
                   </div>
 
                   {/* Courier Policy Notice */}
@@ -2516,18 +2763,18 @@ export default function App() {
                               setUseSavedAddress(event.target.checked);
                               if (event.target.checked && !selectedAddressId) selectDeliveryAddress(savedAddresses[0].id);
                             }} />
-                            Use a saved address
+                            {tr('Use a saved address')}
                           </label>
                           {useSavedAddress && (
                             <>
-                              <select aria-label="Select saved delivery address" value={selectedAddressId} onChange={event => selectDeliveryAddress(event.target.value)}>
+                              <select aria-label={tr('Select saved delivery address')} value={selectedAddressId} onChange={event => selectDeliveryAddress(event.target.value)}>
                                 {savedAddresses.map(saved => <option key={saved.id} value={saved.id}>{saved.fullName} · {saved.street1} · {saved.pincode}</option>)}
                               </select>
                               <p style={{ margin: 0, color: '#555', fontSize: '0.85rem' }}>
-                                {[address.houseNameOrNumber, address.street1, address.street2, address.landmark1, address.landmark2, address.taluk, address.district, address.pincode].filter(Boolean).join(', ')}
+                                {[address.houseNameOrNumber, address.street1, address.street2, address.landmark1, address.landmark2, address.city, address.taluk, address.district, address.pincode].filter(Boolean).join(', ')}
                               </p>
                               <button type="button" disabled={isCheckingPincode || address.pincode.length !== 6} onClick={() => void handleCheckPincode()}>
-                                {isCheckingPincode ? 'Checking pincode...' : 'Check selected pincode online'}
+                                {isCheckingPincode ? tr('Checking pincode...') : tr('Check selected pincode online')}
                               </button>
                               {address.pincodeCheck && <span role="status">{address.pincodeCheck.provider}: {address.pincodeCheck.message}</span>}
                             </>
@@ -2538,15 +2785,15 @@ export default function App() {
                       {!useSavedAddress && (googleUser || !firebaseConfigured) && (
                         <label style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', marginTop: '0.6rem' }}>
                           <input type="checkbox" checked={saveAddressForLater} onChange={event => setSaveAddressForLater(event.target.checked)} />
-                          Save this address for next time
+                          {tr('Save this address for next time')}
                         </label>
                       )}
-                      <p style={{ color: '#666', fontSize: '0.8rem' }}>Delivery address only. The host will confirm courier serviceability before accepting payment.</p>
+                      <p style={{ color: '#666', fontSize: '0.8rem' }}>{tr('Delivery address only. The host will confirm courier serviceability before accepting payment.')}</p>
                       <button
                         onClick={() => setCheckoutStep(2)}
-                        disabled={!address.pincodeCheck || ['NOT_FOUND', 'NOT_SERVICEABLE'].includes(address.pincodeCheck.status) || (useSavedAddress ? !selectedAddressId : !address.fullName || !address.phone || !address.street1 || !address.street2 || !address.landmark1 || !address.taluk || !address.district || !/^\d{6}$/.test(address.pincode))}
+                        disabled={!address.pincodeCheck || ['NOT_FOUND', 'NOT_SERVICEABLE'].includes(address.pincodeCheck.status) || (useSavedAddress ? !selectedAddressId : !address.fullName || !address.phone || !address.street1 || !address.city || !address.landmark1 || !address.district || !/^\d{6}$/.test(address.pincode))}
                         style={{ marginTop: '1.2rem', backgroundColor: '#6e1a3a', color: '#fff', border: 'none', padding: '0.7rem', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', width: '100%' }}
-                      >Next: Item Payment</button>
+                      >{tr('Next: Item Payment')}</button>
                     </div>
                   )}
 
@@ -2556,18 +2803,18 @@ export default function App() {
                       <h3>{t.step2Payment} (₹{cartTotal})</h3>
                       {firebaseConfigured && !googleUser && (
                         <div style={{ backgroundColor: '#f1f8ff', border: '1px solid #cfe3f7', padding: '0.8rem', borderRadius: '6px', margin: '0.6rem 0', fontSize: '0.85rem' }}>
-                          <strong>No account needed.</strong> The host will confirm your order on WhatsApp{address.phone ? ` at ${address.phone}` : ''}. Sign in with Google (optional) to keep track of your orders on any device.
+                          <strong>{tr('No account needed.')}</strong> {tr(address.phone ? 'The host will confirm your order on WhatsApp at {phone}. Sign in with Google (optional) to keep track of your orders on any device.' : 'The host will confirm your order on WhatsApp. Sign in with Google (optional) to keep track of your orders on any device.', { phone: address.phone })}
                           <div style={{ marginTop: '0.5rem' }}>
-                            <GoogleSignInButton onClick={() => void handleGoogleSignIn()} disabled={firebaseLoading} label="Sign in with Google (optional)" />
+                            <GoogleSignInButton onClick={() => void handleGoogleSignIn()} disabled={firebaseLoading} label={tr('Sign in with Google (optional)')} />
                           </div>
                         </div>
                       )}
                       <div style={{ backgroundColor: '#f7f2ef', padding: '1rem', borderRadius: '6px', margin: '0.8rem 0' }}>
-                        <p style={{ marginTop: 0, fontSize: '0.9rem' }}>Scan the payment QR provided by the host, then enter your 12-digit UTR reference.</p>
+                        <p style={{ marginTop: 0, fontSize: '0.9rem' }}>{tr('Scan the payment QR provided by the host, then enter your 12-digit UTR reference.')}</p>
                         {paymentQrUrl ? (
-                          <img src={paymentQrUrl} alt="Host payment QR code" style={{ width: '200px', height: '200px', maxWidth: '100%', objectFit: 'contain', display: 'block', margin: '0 auto' }} />
+                          <img src={paymentQrUrl} alt={tr('Host payment QR code')} style={{ width: '200px', height: '200px', maxWidth: '100%', objectFit: 'contain', display: 'block', margin: '0 auto' }} />
                         ) : (
-                          <p role="status" style={{ marginBottom: 0, color: '#8a4b08' }}>The host has not added a payment QR yet.</p>
+                          <p role="status" style={{ marginBottom: 0, color: '#8a4b08' }}>{tr('The host has not added a payment QR yet.')}</p>
                         )}
                       </div>
                       <input 
@@ -2588,28 +2835,37 @@ export default function App() {
             )}
 
             {customerTab === 'ORDERS' && (
-              <section aria-label="Recent orders and tracking">
+              <section aria-label={tr('Recent orders and tracking')}>
                 <h2 style={{ color: '#6e1a3a', marginTop: 0 }}>{t.myOrders}</h2>
                 {firebaseConfigured && !googleUser && (
                   <div style={{ backgroundColor: '#f1f8ff', border: '1px solid #cfe3f7', padding: '0.8rem', borderRadius: '6px', marginBottom: '1rem', fontSize: '0.85rem', display: 'flex', flexWrap: 'wrap', gap: '0.6rem', alignItems: 'center', justifyContent: 'space-between' }}>
-                    <span>Placed an order before, or want to track orders from any device?</span>
-                    <GoogleSignInButton onClick={() => void handleGoogleSignIn()} disabled={firebaseLoading} label="Sign in with Google" />
+                    <span>{tr('Placed an order before, or want to track orders from any device?')}</span>
+                    <GoogleSignInButton onClick={() => void handleGoogleSignIn()} disabled={firebaseLoading} label={tr('Sign in with Google')} />
                   </div>
                 )}
                 {activeOrders.length === 0 ? (
                   <div style={{ backgroundColor: '#fff', padding: '1.5rem', borderRadius: '8px', border: '1px solid #eee' }}>
-                    <p style={{ marginTop: 0 }}>{firebaseConfigured && !googleUser ? 'No orders on this device yet.' : 'No orders yet.'}</p>
-                    <button type="button" onClick={() => setCustomerTab('SHOP')} style={{ backgroundColor: '#6e1a3a', color: '#fff', border: 0, padding: '0.6rem 1rem', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}>Browse the collection</button>
+                    <p style={{ marginTop: 0 }}>{firebaseConfigured && !googleUser ? tr('No orders on this device yet.') : tr('No orders yet.')}</p>
+                    <button type="button" onClick={() => setCustomerTab('SHOP')} style={{ backgroundColor: '#6e1a3a', color: '#fff', border: 0, padding: '0.6rem 1rem', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}>{tr('Browse the collection')}</button>
                   </div>
-                ) : activeOrders.map(ord => (
-                  <article key={ord.orderId} style={{ backgroundColor: '#fff', border: '1px solid #eee', padding: '1rem', borderRadius: '8px', marginBottom: '1rem' }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'start', gap: '1rem', flexWrap: 'wrap' }}>
-                      <div>
-                        <strong>Order #{ord.orderId}</strong>
-                        <div style={{ color: '#666', fontSize: '0.85rem', marginTop: '0.2rem' }}>Placed {new Date(ord.createdAt).toLocaleString()}</div>
+                ) : activeOrders.map(ord => { const open = Boolean(expandedOrders[ord.orderId]); return (
+                  <article key={ord.orderId} className="mr-order-row" style={{ backgroundColor: '#fff', border: '1px solid #eee', padding: '0.8rem 1rem', borderRadius: '10px', marginBottom: '0.8rem' }}>
+                    <button type="button" className="mr-order-head is-customer" aria-expanded={open} onClick={() => toggleOrder(ord.orderId)}>
+                      <span style={{ minWidth: 0 }}><span className="mr-order-label">{tr('Order ID')}</span><div className="mr-order-value" style={{ fontFamily: 'monospace' }}>{ord.orderId}</div></span>
+                      <span className="mr-col-date" style={{ minWidth: 0 }}><span className="mr-order-label">{tr('Placed on')}</span><div className="mr-order-value">{new Date(ord.createdAt).toLocaleDateString()}</div></span>
+                      <span><span className="mr-order-label">{tr('Total')}</span><div className="mr-order-value" style={{ color: '#6e1a3a' }}>₹{ord.itemTotal}</div></span>
+                      <span className="mr-status-chip">{tr(getOrderStatus(ord))}</span>
+                      <span className="mr-chevron" aria-hidden="true">›</span>
+                    </button>
+                    {open && (
+                    <div className="mr-expand">
+                    <OrderTimeline order={ord} />
+                    {ord.hostMessage && (
+                      <div role="status" style={{ margin: '0.7rem 0', padding: '0.7rem', background: '#eef6ff', border: '1px solid #cfe3f7', borderRadius: '8px' }}>
+                        <strong>{tr('Message from Mala Royale')}</strong>
+                        <p style={{ margin: '0.3rem 0 0', whiteSpace: 'pre-wrap' }}>{ord.hostMessage}</p>
                       </div>
-                      <span style={{ color: '#6e1a3a', fontWeight: 'bold' }}>{getOrderStatus(ord)}</span>
-                    </div>
+                    )}
                     <ul style={{ margin: '0.8rem 0', paddingLeft: '1.2rem' }}>
                       {ord.items.map((item, index) => (
                         <li key={`${item.productId}-${index}`} style={{ marginBottom: '0.25rem' }}>
@@ -2617,56 +2873,66 @@ export default function App() {
                         </li>
                       ))}
                     </ul>
-                    <p style={{ margin: '0.4rem 0', fontWeight: 'bold' }}>Order total: ₹{ord.itemTotal}</p>
-                    <p style={{ margin: '0.4rem 0', color: '#666', fontSize: '0.85rem' }}>Last updated {new Date(ord.updatedAt).toLocaleString()}</p>
+                    <p style={{ margin: '0.4rem 0', fontWeight: 'bold' }}>{tr('Order total: ₹')}{ord.itemTotal}</p>
+                    <p style={{ margin: '0.4rem 0', color: '#666', fontSize: '0.85rem' }}>{tr('Last updated')} {new Date(ord.updatedAt).toLocaleString()}</p>
                     <div style={{ margin: '0.7rem 0', padding: '0.75rem', backgroundColor: '#f7f2ef', borderRadius: '6px' }}>
-                      <strong>Delivery address submitted</strong>
+                      <strong>{tr('Delivery address submitted')}</strong>
                       <p style={{ margin: '0.35rem 0' }}>{ord.address.fullName} · {ord.address.phone}</p>
                       <p style={{ margin: '0.35rem 0' }}>
-                        {[ord.address.houseNameOrNumber, ord.address.street1, ord.address.street2, ord.address.landmark1, ord.address.landmark2, ord.address.taluk, ord.address.district, ord.address.pincode].filter(Boolean).join(', ') || ord.address.street}
+                        {[ord.address.houseNameOrNumber, ord.address.street1, ord.address.street2, ord.address.landmark1, ord.address.landmark2, ord.address.city, ord.address.taluk, ord.address.district, ord.address.pincode].filter(Boolean).join(', ') || ord.address.street}
                       </p>
                       <p role="status" style={{ margin: '0.35rem 0', color: ord.deliveryConfirmed ? '#1b5e20' : '#8a4b08' }}>
-                        {ord.deliveryConfirmed ? `Host confirmed deliverable${ord.deliveryConfirmedAt ? ` · ${new Date(ord.deliveryConfirmedAt).toLocaleString()}` : ''}` : 'Waiting for host to confirm delivery serviceability'}
+                        {ord.deliveryConfirmed ? `Host confirmed deliverable${ord.deliveryConfirmedAt ? ` · ${new Date(ord.deliveryConfirmedAt).toLocaleString()}` : ''}` : tr('Waiting for host to confirm delivery serviceability')}
                       </p>
                     </div>
                     {ord.courierBill && (
                       <div style={{ marginTop: '0.6rem', backgroundColor: '#e8f5e9', padding: '0.8rem', borderRadius: '6px', fontSize: '0.9rem' }}>
-                        <p style={{ margin: 0 }}>Courier: <strong>{ord.courierBill.courierName}</strong></p>
-                        <p style={{ margin: '0.2rem 0' }}>Tracking ID: <strong>{ord.courierBill.trackingId}</strong></p>
-                        <p style={{ margin: 0 }}>Courier Charge: <strong>₹{ord.courierBill.amount}</strong></p>
+                        <p style={{ margin: 0 }}>{tr('Courier:')} <strong>{ord.courierBill.courierName}</strong></p>
+                        <p style={{ margin: '0.2rem 0' }}>{tr('Tracking ID:')} <strong>{ord.courierBill.trackingId}</strong></p>
+                        <p style={{ margin: 0 }}>{tr('Courier Charge:')} <strong>₹{ord.courierBill.amount}</strong></p>
                       </div>
                     )}
                     {ord.courierBill && <CourierPaymentForm order={ord} paymentQrUrl={paymentQrUrl} canSubmit={!firebaseConfigured || Boolean(firebaseUser)} onSubmit={handleCourierPayment} />}
+                    </div>
+                    )}
                   </article>
-                ))}
+                ); })}
               </section>
             )}
 
+            {customerTab === 'ABOUT' && (
+              <AboutSection
+                onSubmitFeedback={handleSubmitFeedback}
+                signInButton={<GoogleSignInButton onClick={() => void handleGoogleSignIn()} disabled={firebaseLoading} label={tr('Sign in with Google')} />}
+              />
+            )}
+            </div>
+
             {placedOrder && (
               <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.6)', display: 'flex', justifyContent: 'center', alignItems: 'center', zIndex: 1100, padding: '1rem' }}>
-                <div role="dialog" aria-label="Order placed" style={{ backgroundColor: '#fff', maxWidth: '460px', width: '100%', maxHeight: '90vh', overflowY: 'auto', borderRadius: '12px', padding: '1.8rem', textAlign: 'center' }}>
+                <div role="dialog" aria-label={tr('Order placed')} style={{ backgroundColor: '#fff', maxWidth: '460px', width: '100%', maxHeight: '90vh', overflowY: 'auto', borderRadius: '12px', padding: '1.8rem', textAlign: 'center' }}>
                   <div style={{ fontSize: '2.4rem' }} aria-hidden="true">✅</div>
-                  <h2 style={{ color: '#6e1a3a', margin: '0.3rem 0' }}>Order placed!</h2>
-                  <p style={{ margin: '0.3rem 0', color: '#555' }}>Thank you, {placedOrder.name}. Your order ID is:</p>
+                  <h2 style={{ color: '#6e1a3a', margin: '0.3rem 0' }}>{tr('Order placed!')}</h2>
+                  <p style={{ margin: '0.3rem 0', color: '#555' }}>{tr('Thank you, {name}. Your order ID is:', { name: placedOrder.name })}</p>
                   <div style={{ fontFamily: 'monospace', fontSize: '1.3rem', fontWeight: 'bold', backgroundColor: '#f7f2ef', padding: '0.7rem', borderRadius: '6px', letterSpacing: '0.04em', wordBreak: 'break-all' }}>{placedOrder.orderId}</div>
                   <button
                     type="button"
                     onClick={() => { void navigator.clipboard?.writeText(placedOrder.orderId).then(() => setOrderCopied(true)).catch(() => undefined); }}
                     style={{ marginTop: '0.6rem', padding: '0.45rem 0.9rem', cursor: 'pointer' }}
                   >
-                    {orderCopied ? 'Copied ✓' : 'Copy order ID'}
+                    {orderCopied ? tr('Copied ✓') : tr('Copy order ID')}
                   </button>
-                  <p style={{ margin: '0.9rem 0 0.3rem', fontWeight: 'bold' }}>Order total: ₹{placedOrder.total}</p>
+                  <p style={{ margin: '0.9rem 0 0.3rem', fontWeight: 'bold' }}>{tr('Order total: ₹')}{placedOrder.total}</p>
                   <p style={{ color: '#666', fontSize: '0.85rem', margin: '0.3rem 0 1rem' }}>
-                    The host will verify your payment and confirm your order on WhatsApp at {placedOrder.phone}. Keep this order ID for any questions.
+                    {tr('The host will verify your payment and confirm your order on WhatsApp at {phone}. Keep this order ID for any questions.', { phone: placedOrder.phone })}
                   </p>
                   {firebaseConfigured && !googleUser && (
                     <div style={{ marginBottom: '1rem' }}>
-                      <p style={{ color: '#666', fontSize: '0.8rem', margin: '0 0 0.5rem' }}>Want to track this order from any device?</p>
-                      <GoogleSignInButton onClick={() => void handleGoogleSignIn()} disabled={firebaseLoading} label="Sign in with Google" />
+                      <p style={{ color: '#666', fontSize: '0.8rem', margin: '0 0 0.5rem' }}>{tr('Want to track this order from any device?')}</p>
+                      <GoogleSignInButton onClick={() => void handleGoogleSignIn()} disabled={firebaseLoading} label={tr('Sign in with Google')} />
                     </div>
                   )}
-                  <button type="button" onClick={() => setPlacedOrder(null)} style={{ backgroundColor: '#6e1a3a', color: '#fff', border: 'none', padding: '0.7rem 1.2rem', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', width: '100%' }}>View my orders</button>
+                  <button type="button" onClick={() => setPlacedOrder(null)} style={{ backgroundColor: '#6e1a3a', color: '#fff', border: 'none', padding: '0.7rem 1.2rem', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', width: '100%' }}>{tr('View my orders')}</button>
                 </div>
               </div>
             )}
@@ -2675,52 +2941,68 @@ export default function App() {
 
       </div>
 
+      {shareTarget && <ShareMenu product={shareTarget} onClose={() => setShareTarget(null)} />}
+
       {!isStaff && (
         <div style={{ position: 'fixed', right: '16px', bottom: '16px', zIndex: 900, display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '0.6rem' }}>
           {isEnquiryOpen && (
-            <div role="dialog" aria-label="Send us an enquiry" style={{ width: 'min(330px, calc(100vw - 32px))', maxHeight: '80vh', overflowY: 'auto', backgroundColor: '#fff', borderRadius: '12px', boxShadow: '0 8px 30px rgba(0,0,0,0.25)' }}>
+            <div role="dialog" aria-label={tr('Send us an enquiry')} style={{ width: 'min(330px, calc(100vw - 32px))', maxHeight: '80vh', overflowY: 'auto', backgroundColor: '#fff', borderRadius: '12px', boxShadow: '0 8px 30px rgba(0,0,0,0.25)' }}>
               <div style={{ backgroundColor: '#075e54', color: '#fff', padding: '0.8rem 1rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                 <div>
-                  <strong>Mala Royale</strong>
-                  <div style={{ fontSize: '0.75rem', opacity: 0.85 }}>Ask us anything. We reply on WhatsApp.</div>
+                  <strong>{tr('Mala Royale')}</strong>
+                  <div style={{ fontSize: '0.75rem', opacity: 0.85 }}>{tr('Ask us anything. We reply on WhatsApp.')}</div>
                 </div>
-                <button type="button" aria-label="Close chat" onClick={() => setIsEnquiryOpen(false)} style={{ background: 'none', border: 'none', color: '#fff', fontSize: '1.2rem', cursor: 'pointer' }}>✕</button>
+                <button type="button" aria-label={tr('Close chat')} onClick={() => setIsEnquiryOpen(false)} style={{ background: 'none', border: 'none', color: '#fff', fontSize: '1.2rem', cursor: 'pointer' }}>✕</button>
               </div>
               {enquirySent ? (
                 <div style={{ padding: '1.3rem', textAlign: 'center', backgroundColor: '#ece5dd' }}>
                   <div style={{ fontSize: '2rem' }} aria-hidden="true">✅</div>
-                  <strong>Enquiry sent!</strong>
-                  <p style={{ color: '#555', fontSize: '0.85rem' }}>We will reply to you on WhatsApp shortly.</p>
-                  <button type="button" onClick={() => { setEnquirySent(false); setEnquiryProduct(null); setIsEnquiryOpen(false); }} style={{ backgroundColor: '#25d366', color: '#fff', border: 'none', borderRadius: '8px', padding: '0.55rem 1.2rem', fontWeight: 'bold', cursor: 'pointer' }}>Close</button>
+                  <strong>{tr('Enquiry sent!')}</strong>
+                  <p style={{ color: '#555', fontSize: '0.85rem' }}>{tr('We will reply to you on WhatsApp shortly.')}</p>
+                  <button type="button" onClick={() => { setEnquirySent(false); setEnquiryProduct(null); setIsEnquiryOpen(false); }} style={{ backgroundColor: '#25d366', color: '#fff', border: 'none', borderRadius: '8px', padding: '0.55rem 1.2rem', fontWeight: 'bold', cursor: 'pointer' }}>{tr('Close')}</button>
                 </div>
               ) : (
                 <div style={{ padding: '0.9rem', display: 'grid', gap: '0.6rem', backgroundColor: '#ece5dd' }}>
                   {enquiryProduct && (
                     <div style={{ fontSize: '0.8rem', backgroundColor: '#fff', borderRadius: '6px', padding: '0.4rem 0.6rem', display: 'flex', justifyContent: 'space-between', gap: '0.5rem', alignItems: 'center' }}>
-                      <span>About: <strong>{enquiryProduct.name}</strong></span>
-                      <button type="button" aria-label="Remove product from enquiry" onClick={() => setEnquiryProduct(null)} style={{ background: 'none', border: 'none', cursor: 'pointer' }}>✕</button>
+                      <span>{tr('About:')} <strong>{enquiryProduct.name}</strong></span>
+                      <button type="button" aria-label={tr('Remove product from enquiry')} onClick={() => setEnquiryProduct(null)} style={{ background: 'none', border: 'none', cursor: 'pointer' }}>✕</button>
                     </div>
                   )}
-                  <input aria-label="Your name" placeholder="Your name *" maxLength={80} value={enquiryName} onChange={event => setEnquiryName(event.target.value)} style={{ padding: '0.5rem', borderRadius: '6px', border: '1px solid #ccc' }} />
-                  <input aria-label="Your WhatsApp number" type="tel" inputMode="numeric" placeholder="Your WhatsApp number *" maxLength={16} value={enquiryPhone} onChange={event => setEnquiryPhone(event.target.value)} style={{ padding: '0.5rem', borderRadius: '6px', border: '1px solid #ccc' }} />
-                  <textarea aria-label="Your message" rows={4} maxLength={1000} placeholder="Type your question *" value={enquiryMessage} onChange={event => setEnquiryMessage(event.target.value)} style={{ padding: '0.5rem', borderRadius: '6px', border: '1px solid #ccc', resize: 'vertical' }} />
+                  <input aria-label={tr('Your name')} placeholder={tr('Your name *')} maxLength={80} value={enquiryName} onChange={event => setEnquiryName(event.target.value)} style={{ padding: '0.5rem', borderRadius: '6px', border: '1px solid #ccc' }} />
+                  <input aria-label={tr('Your WhatsApp number')} type="tel" inputMode="numeric" placeholder={tr('Your WhatsApp number *')} maxLength={16} value={enquiryPhone} onChange={event => setEnquiryPhone(event.target.value)} style={{ padding: '0.5rem', borderRadius: '6px', border: '1px solid #ccc' }} />
+                  <textarea aria-label={tr('Your message')} rows={4} maxLength={1000} placeholder={tr('Type your question *')} value={enquiryMessage} onChange={event => setEnquiryMessage(event.target.value)} style={{ padding: '0.5rem', borderRadius: '6px', border: '1px solid #ccc', resize: 'vertical' }} />
                   <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.4rem' }}>
                     {['Is this available?', 'What are the courier charges?', 'I want a custom Kuchu'].map(chip => (
                       <button key={chip} type="button" onClick={() => setEnquiryMessage(chip)} style={{ backgroundColor: '#fff', border: '1px solid #bbb', borderRadius: '999px', padding: '0.25rem 0.6rem', fontSize: '0.75rem', cursor: 'pointer' }}>{chip}</button>
                     ))}
                   </div>
                   {enquiryError && <p role="alert" style={{ color: '#b00020', margin: 0, fontSize: '0.8rem' }}>{enquiryError}</p>}
-                  <button type="button" disabled={enquirySending} onClick={() => void sendEnquiry()} style={{ backgroundColor: '#25d366', color: '#fff', border: 'none', borderRadius: '8px', padding: '0.65rem', fontWeight: 'bold', cursor: enquirySending ? 'not-allowed' : 'pointer', opacity: enquirySending ? 0.7 : 1 }}>{enquirySending ? 'Sending...' : 'Send enquiry'}</button>
-                  <small style={{ color: '#555' }}>We will reply to you on WhatsApp at the number you enter.</small>
+                  {enquiryNeedsSignIn && !googleUser && (
+                    <GoogleSignInButton onClick={() => void handleGoogleSignIn()} disabled={firebaseLoading} label={tr('Sign in with Google')} />
+                  )}
+                  <button type="button" disabled={enquirySending} onClick={() => void sendEnquiry()} style={{ backgroundColor: '#25d366', color: '#fff', border: 'none', borderRadius: '8px', padding: '0.65rem', fontWeight: 'bold', cursor: enquirySending ? 'not-allowed' : 'pointer', opacity: enquirySending ? 0.7 : 1 }}>{enquirySending ? tr('Sending...') : tr('Send enquiry')}</button>
+                  <small style={{ color: '#555' }}>{tr('We will reply to you on WhatsApp at the number you enter.')}</small>
+                  {hostWhatsApp && (
+                    <a
+                      href={whatsAppLink(hostWhatsApp, `${enquiryName.trim() ? `Hi, I'm ${enquiryName.trim()}. ` : 'Hi! '}${enquiryMessage.trim()}`)}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      style={{ textAlign: 'center', color: '#075e54', fontWeight: 'bold', fontSize: '0.82rem' }}
+                    >
+                      {tr('Or message us directly on WhatsApp')}
+                    </a>
+                  )}
                 </div>
               )}
             </div>
           )}
-          <button type="button" aria-label="Chat with us" onClick={() => (isEnquiryOpen ? setIsEnquiryOpen(false) : openEnquiry())} style={{ width: '58px', height: '58px', borderRadius: '50%', backgroundColor: '#25d366', border: 'none', boxShadow: '0 4px 14px rgba(0,0,0,0.3)', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <button type="button" aria-label={tr('Chat with us')} onClick={() => (isEnquiryOpen ? setIsEnquiryOpen(false) : openEnquiry())} style={{ width: '58px', height: '58px', borderRadius: '50%', backgroundColor: '#25d366', border: 'none', boxShadow: '0 4px 14px rgba(0,0,0,0.3)', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
             <WhatsAppIcon />
           </button>
         </div>
       )}
     </div>
+    </TrContext.Provider>
   );
 }

@@ -1,5 +1,6 @@
 import type { Product } from '../../domain/types';
 import { DAY_MS, productCreatedMs } from '../../analytics/orderMetrics';
+import { interpolate, type TrFn } from '../../lang/ui';
 
 /*
  * Offer engine: decides WHICH offers to show and writes the copy for them.
@@ -58,6 +59,8 @@ export interface OfferInput {
   activeCategory: string;
   cartCount: number;
   now: number;
+  /** Translates the offer copy. Defaults to English. */
+  tr?: TrFn;
 }
 
 /** Seconds on a category before it counts as an interest signal. */
@@ -102,10 +105,11 @@ function pick<T>(seed: string, options: T[]): T {
   return options[hash % options.length];
 }
 
-const plural = (count: number, word: string) => `${count} ${word}${count === 1 ? '' : 's'}`;
+const many = (count: number, one: string, other: string): string => (count === 1 ? one : other);
 
 export function buildOffers(input: OfferInput): Offer[] {
   const { products, context, activeCategory, cartCount, now } = input;
+  const t: TrFn = input.tr ?? ((text, vars) => interpolate(text, vars));
   const day = String(Math.floor(now / DAY_MS));
   const buyable = products.filter(isBuyable);
   const offers: Offer[] = [];
@@ -124,14 +128,14 @@ export function buildOffers(input: OfferInput): Offer[] {
       kind: 'cart',
       priority: 90,
       accent: 'emerald',
-      badge: plural(cartCount, 'item'),
+      badge: t(many(cartCount, '{count} item', '{count} items'), { count: cartCount }),
       headline: pick(`cart${day}`, [
-        'Your cart is waiting for you',
-        'Ready when you are: your cart is saved',
-        'Pieces you loved are still in your cart',
+        t('Your cart is waiting for you'),
+        t('Ready when you are: your cart is saved'),
+        t('Pieces you loved are still in your cart'),
       ]),
-      subline: 'Finish your order while they are still in stock.',
-      cta: { label: 'Review cart', action: { type: 'open-cart' } },
+      subline: t('Finish your order while they are still in stock.'),
+      cta: { label: t('Review cart'), action: { type: 'open-cart' } },
     });
   }
 
@@ -151,15 +155,15 @@ export function buildOffers(input: OfferInput): Offer[] {
       kind: 'lowstock',
       priority: relevant ? 85 : 60,
       accent: 'rose',
-      badge: `Only ${scarce.quantity} left`,
+      badge: t('Only {count} left', { count: scarce.quantity ?? 0 }),
       imageUrl: firstImage(scarce),
       headline: pick(`low${scarce.id}${day}`, [
-        `Only ${scarce.quantity} left: ${scarce.name}`,
-        `Going fast: ${scarce.name}`,
-        `Almost gone: ${scarce.name}`,
+        t('Only {count} left: {name}', { count: scarce.quantity ?? 0, name: scarce.name }),
+        t('Going fast: {name}', { name: scarce.name }),
+        t('Almost gone: {name}', { name: scarce.name }),
       ]),
-      subline: 'Handcrafted pieces sell quickly. Grab yours before it is gone.',
-      cta: { label: `See ${scarce.category}`, action: { type: 'shop-category', category: scarce.category } },
+      subline: t('Handcrafted pieces sell quickly. Grab yours before it is gone.'),
+      cta: { label: t('See {category}', { category: t(scarce.category) }), action: { type: 'shop-category', category: scarce.category } },
     });
   }
 
@@ -174,15 +178,15 @@ export function buildOffers(input: OfferInput): Offer[] {
         kind: 'category',
         priority: topInterest ? 80 : 65,
         accent: 'gold',
-        badge: `Up to ${maxPercent}% off`,
+        badge: t('Up to {percent}% off', { percent: maxPercent }),
         imageUrl: firstImage(showcase),
         headline: pick(`cat${focusCategory}${day}`, [
-          `${focusCategory} you will love: up to ${maxPercent}% off`,
-          `Still thinking about ${focusCategory}? Save up to ${maxPercent}%`,
-          `Handpicked ${focusCategory}, now up to ${maxPercent}% off`,
+          t('{category} you will love: up to {percent}% off', { category: t(focusCategory), percent: maxPercent }),
+          t('Still thinking about {category}? Save up to {percent}%', { category: t(focusCategory), percent: maxPercent }),
+          t('Handpicked {category}, now up to {percent}% off', { category: t(focusCategory), percent: maxPercent }),
         ]),
-        subline: `${plural(discounted.length, 'piece')} on offer right now. Limited stock.`,
-        cta: { label: `Shop ${focusCategory} offers`, action: { type: 'shop-category', category: focusCategory, onlyOffers: true } },
+        subline: t(many(discounted.length, '{count} piece on offer right now. Limited stock.', '{count} pieces on offer right now. Limited stock.'), { count: discounted.length }),
+        cta: { label: t('Shop {category} offers', { category: t(focusCategory) }), action: { type: 'shop-category', category: focusCategory, onlyOffers: true } },
       });
     }
   }
@@ -201,12 +205,12 @@ export function buildOffers(input: OfferInput): Offer[] {
       badge: 'NEW',
       imageUrl: firstImage(fresh[0]),
       headline: pick(`new${fresh[0].id}${day}`, [
-        `Just landed: ${plural(fresh.length, 'new arrival')}`,
-        `Fresh from our studio: ${plural(fresh.length, 'new piece')}`,
-        `New in at Mala Royale: ${plural(fresh.length, 'arrival')}`,
+        t(many(fresh.length, 'Just landed: {count} new arrival', 'Just landed: {count} new arrivals'), { count: fresh.length }),
+        t(many(fresh.length, 'Fresh from our studio: {count} new piece', 'Fresh from our studio: {count} new pieces'), { count: fresh.length }),
+        t(many(fresh.length, 'New in at Mala Royale: {count} arrival', 'New in at Mala Royale: {count} arrivals'), { count: fresh.length }),
       ]),
       subline: names,
-      cta: { label: 'See what is new', action: { type: 'show-new' } },
+      cta: { label: t('See what is new'), action: { type: 'show-new' } },
     });
   }
 
@@ -218,10 +222,12 @@ export function buildOffers(input: OfferInput): Offer[] {
       kind: 'welcome',
       priority: 55,
       accent: 'maroon',
-      badge: 'Welcome back',
-      headline: 'Good to see you again',
-      subline: sinceLast > 0 ? `${plural(sinceLast, 'new piece')} since your last visit.` : 'We have refreshed the collection for you.',
-      cta: sinceLast > 0 ? { label: 'See what is new', action: { type: 'show-new' } } : { label: 'Browse offers', action: { type: 'show-offers' } },
+      badge: t('Welcome back'),
+      headline: t('Good to see you again'),
+      subline: sinceLast > 0
+        ? t(many(sinceLast, '{count} new piece since your last visit.', '{count} new pieces since your last visit.'), { count: sinceLast })
+        : t('We have refreshed the collection for you.'),
+      cta: sinceLast > 0 ? { label: t('See what is new'), action: { type: 'show-new' } } : { label: t('Browse offers'), action: { type: 'show-offers' } },
     });
   }
 
@@ -235,15 +241,15 @@ export function buildOffers(input: OfferInput): Offer[] {
       kind: 'offers',
       priority: 50,
       accent: 'gold',
-      badge: `Up to ${maxPercent}% off`,
+      badge: t('Up to {percent}% off', { percent: maxPercent }),
       imageUrl: firstImage(showcase),
       headline: pick(`offers${day}`, [
-        `Special offers: up to ${maxPercent}% off`,
-        `Treat yourself: save up to ${maxPercent}%`,
-        `Limited-time prices on ${plural(allDiscounted.length, 'piece')}`,
+        t('Special offers: up to {percent}% off', { percent: maxPercent }),
+        t('Treat yourself: save up to {percent}%', { percent: maxPercent }),
+        t(many(allDiscounted.length, 'Limited-time price on {count} piece', 'Limited-time prices on {count} pieces'), { count: allDiscounted.length }),
       ]),
-      subline: 'Premium sarees and custom kuchu at special prices.',
-      cta: { label: 'Shop offers', action: { type: 'show-offers' } },
+      subline: t('Premium sarees and custom kuchu at special prices.'),
+      cta: { label: t('Shop offers'), action: { type: 'show-offers' } },
     });
   }
 
@@ -254,9 +260,9 @@ export function buildOffers(input: OfferInput): Offer[] {
     priority: 10,
     accent: 'maroon',
     badge: 'Mala Royale',
-    headline: 'Handcrafted sarees and custom kuchu',
-    subline: 'Premium weaves, made to be treasured.',
-    cta: { label: 'Shop the collection', action: { type: 'shop-category', category: 'All' } },
+    headline: t('Handcrafted sarees and custom kuchu'),
+    subline: t('Premium weaves, made to be treasured.'),
+    cta: { label: t('Shop the collection'), action: { type: 'shop-category', category: 'All' } },
   });
 
   /* Hide offers the visitor dismissed recently, then rank. */

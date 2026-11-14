@@ -39,7 +39,7 @@ export function orderStageLabel(order: Order): string {
 
 export function formatAddress(order: Order): string {
   const a = order.address;
-  const joined = [a.houseNameOrNumber, a.street1, a.street2, a.landmark1, a.landmark2, a.taluk, a.district, a.pincode]
+  const joined = [a.houseNameOrNumber, a.street1, a.street2, a.landmark1, a.landmark2, a.city, a.taluk, a.district, a.state, a.pincode]
     .filter(Boolean)
     .join(', ');
   return joined || a.street || '';
